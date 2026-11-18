@@ -46,7 +46,14 @@ pub fn prepare_main() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+// UIKit fixes the main thread stack size. The iOS event handler grows its stack
+// for game callbacks, and guest entry still checks its own stack requirements.
+#[cfg(target_os = "ios")]
+fn prepare() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 fn prepare() -> std::io::Result<()> {
     // Executable link settings reserve the same stack on Windows and macOS.
     inspect_current().map_err(std::io::Error::other)
