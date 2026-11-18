@@ -120,6 +120,49 @@ pub trait Clipboard {
     fn set(&mut self, text: &str);
 }
 
+/// iOS has no arboard backend: the system clipboard is UIKit's general
+/// pasteboard (`UIPasteboard.generalPasteboard.string`), in arboard's shape.
+#[cfg(target_os = "ios")]
+#[allow(unsafe_code)]
+mod arboard {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+
+    pub struct Clipboard;
+    pub enum Error {
+        ContentNotAvailable,
+        Unavailable,
+    }
+
+    fn general() -> Option<Retained<AnyObject>> {
+        // SAFETY: `generalPasteboard` is a class method taking nothing and returning the
+        // shared UIPasteboard (UIKit is linked by winit on iOS).
+        unsafe { msg_send![class!(UIPasteboard), generalPasteboard] }
+    }
+
+    impl Clipboard {
+        pub fn new() -> Result<Self, Error> {
+            Ok(Self)
+        }
+        pub fn get_text(&mut self) -> Result<String, Error> {
+            let board = general().ok_or(Error::Unavailable)?;
+            // SAFETY: `string` takes nothing and returns an NSString or nil.
+            let text: Option<Retained<NSString>> = unsafe { msg_send![&*board, string] };
+            text.map(|t| t.to_string())
+                .ok_or(Error::ContentNotAvailable)
+        }
+        pub fn set_text(&mut self, text: String) -> Result<(), Error> {
+            let board = general().ok_or(Error::Unavailable)?;
+            let text = NSString::from_str(&text);
+            // SAFETY: `setString:` takes an NSString and returns nothing.
+            let () = unsafe { msg_send![&*board, setString: &*text] };
+            Ok(())
+        }
+    }
+}
+
 /// The system clipboard (`ClipboardManager`). On Wayland, arboard uses the
 /// data-control protocol and falls back to X11 (XWayland) on compositors
 /// without it. When no system clipboard can be reached, text copied in the
