@@ -2,6 +2,7 @@
 //! (`GameCpuResources`, `EntityModels`), what the background loader publishes (`Loaded`,
 //! `LoaderMsg`), the world's rest loader and a pending world entry, the ordinary launch
 //! (`run_loading`) and the smoke run's report (`write_report`).
+use super::loading_screen::BigStack;
 use super::*;
 
 /// CPU-only startup data, owned by one loader generation. No file reads or
@@ -288,11 +289,13 @@ pub(super) fn run_loading(
         shown: false,
         ui_at: None,
         title_drawn: false,
+        #[cfg(target_os = "ios")]
+        ime_allowed: false,
         menu,
         error: None,
     };
     let mut app = App::Loading(Box::new(loading));
-    let result = EventLoop::new()?.run_app(&mut app);
+    let result = EventLoop::new()?.run_app(&mut BigStack(&mut app));
     narrator::stop();
     match &mut app {
         // Ready: splitscreen around P1's game.
