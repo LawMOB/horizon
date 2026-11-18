@@ -1417,11 +1417,11 @@ impl Game<'_> {
     pub(super) fn chat_click(&mut self) {
         let cursor = self.cursor;
         let height = self.renderer.as_ref().map_or(720.0, |r| {
-            HudBatch::new(
+            let gui = HudBatch::new(
                 [r.config.width, r.config.height],
                 self.settings.gui_scale_inputs(),
-            )
-            .height
+            );
+            self.chat_height(gui.height, gui.scale)
         });
         let m = Measure(&self.gui.atlas.font);
         let c = Commands {
@@ -1693,6 +1693,8 @@ impl Game<'_> {
         let now = self.visual_ticks() as f32 + self.clock.fraction() as f32;
         // NeoForge's `CustomizeGuiOverlayEvent.Chat`: a mod may move the chat's bottom-left
         // corner, and the chat is drawn shifted by as much (`Gui.renderChat`'s translate).
+        let full_height = batch.height;
+        batch.height = self.chat_height(full_height, batch.scale);
         let (width, height) = (batch.width as i32, batch.height as i32);
         let (home_x, home_y) = (0, height - 40);
         let (mut x, mut y) = (home_x, home_y);
@@ -1701,6 +1703,7 @@ impl Game<'_> {
         self.ui
             .chat
             .draw_at(batch, &self.gui.atlas, now, focused, offset);
+        batch.height = full_height;
     }
     /// `HoverEvent.EntityTooltipInfo.getTooltipLines`: the name when the
     /// event has one, the entity type and the UUID.
@@ -1740,6 +1743,13 @@ impl Game<'_> {
     pub(super) fn draw_chat_screen(&mut self, batch: &mut HudBatch) {
         self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         self.gui_layer("minecraft:chat", batch, |g, batch| g.draw_chat(batch));
+        let full_height = batch.height;
+        batch.height = self.chat_height(full_height, batch.scale);
+        self.draw_chat_screen_above_keyboard(batch);
+        batch.height = full_height;
+    }
+
+    fn draw_chat_screen_above_keyboard(&mut self, batch: &mut HudBatch) {
         let Some(mut screen) = self.ui.chat_screen.take() else {
             self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
             return;
