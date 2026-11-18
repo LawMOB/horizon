@@ -13,7 +13,6 @@ horizon-client-core = { path = "../horizon-client-core" }
 winit = "0.30.13"
 log = "0.4"
 png = "0.18"
-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 
 [dev-dependencies]
 # The window icon test decodes Horizon's icon.
@@ -24,3 +23,10 @@ controllers = []
 
 [lints]
 workspace = true
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
