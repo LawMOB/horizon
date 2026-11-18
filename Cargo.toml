@@ -168,3 +168,10 @@ inherits = "release"
 lto = false
 codegen-units = 16
 incremental = true
+
+# Optimized iPhone/iPad builds, packaged as a sideloadable IPA.
+[profile.ios]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+incremental = false
