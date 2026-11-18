@@ -876,6 +876,28 @@ fn portal_ticket_can_expire(
 /// from the keysym the keymap resolved instead. This includes function keys on
 /// remapped media rows; ordinary character bindings still use their physical key.
 fn follow_keymap(event: &mut WindowEvent) {
+    // The iPhone keyboard's Return arrives as the text "\n" (winit's insertText): it's Enter.
+    #[cfg(target_os = "ios")]
+    if let WindowEvent::KeyboardInput { event, .. } = event
+        && matches!(&event.logical_key, winit::keyboard::Key::Character(c) if matches!(c.as_str(), "\n" | "\r"))
+    {
+        event.logical_key = winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter);
+        event.physical_key = PhysicalKey::Code(KeyCode::Enter);
+        event.text = None;
+        return;
+    }
+    // Its delete key arrives with no key code (winit's deleteBackward): it's Backspace.
+    #[cfg(target_os = "ios")]
+    if let WindowEvent::KeyboardInput { event, .. } = event
+        && matches!(event.physical_key, PhysicalKey::Unidentified(_))
+        && matches!(
+            event.logical_key,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)
+        )
+    {
+        event.physical_key = PhysicalKey::Code(KeyCode::Backspace);
+        return;
+    }
     if let WindowEvent::KeyboardInput { event, .. } = event {
         follow_named_keymap(&event.logical_key, &mut event.physical_key);
     }
@@ -1115,6 +1137,8 @@ struct Game<'a> {
     focus_after_run: Option<bool>,
     /// Whether the window currently accepts input method events.
     ime_allowed: bool,
+    /// Whether a tap dismissed the iOS keyboard, and the caret area that can reopen it.
+    soft_keyboard: ios_keyboard::SoftKeyboard,
     /// The candidate window's area last given to the window, in pixels.
     ime_area: Option<[i32; 4]>,
     /// When the window lost focus, while it is still without
@@ -4653,6 +4677,8 @@ impl Game<'_> {
         self.frame_graph
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_over_hud(&mut batch);
+        self.draw_touch_controls(&mut batch);
+        self.draw_touch_close(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
@@ -4819,39 +4845,43 @@ impl Game<'_> {
                     }
                 });
             }
-            self.gui_layer("minecraft:hotbar", &mut batch, |g, batch| {
-                if spectator {
-                    g.draw_spectator_hotbar(batch);
-                } else {
-                    let partial = g.clock.fraction() as f32;
-                    let inputs = hud_layout::HotbarInputs {
-                        selected: g.selected as i32,
-                        right_handed: !g.settings.main_hand_left,
-                        offhand: g.offhand.is_some(),
-                        slots: std::array::from_fn(|i| {
-                            g.inventory[i]
-                                .as_ref()
-                                .map(|_| (f32::from(g.hotbar_pop[i]) - partial).max(0.0))
-                        }),
-                        offhand_pop: (f32::from(g.hotbar_pop[9]) - partial).max(0.0),
-                        attack: (indicator == 2).then_some(strength),
-                    };
-                    let draws = hud_layout::hotbar(wi, hi, &inputs);
-                    hud_layout::paint(batch, &g.gui.atlas, &draws);
-                    for d in &draws {
-                        if let hud_layout::GuiDraw::Item { slot, x, y, .. } = *d {
-                            let stack = if slot == 40 {
-                                g.offhand.as_ref()
-                            } else {
-                                g.inventory[slot as usize].as_ref()
-                            };
-                            if let Some(stack) = stack {
-                                g.draw_item(batch, stack, x as f32, y as f32);
+            {
+                let mark = batch.vertices.len();
+                self.gui_layer("minecraft:hotbar", &mut batch, |g, batch| {
+                    if spectator {
+                        g.draw_spectator_hotbar(batch);
+                    } else {
+                        let partial = g.clock.fraction() as f32;
+                        let inputs = hud_layout::HotbarInputs {
+                            selected: g.selected as i32,
+                            right_handed: !g.settings.main_hand_left,
+                            offhand: g.offhand.is_some(),
+                            slots: std::array::from_fn(|i| {
+                                g.inventory[i]
+                                    .as_ref()
+                                    .map(|_| (f32::from(g.hotbar_pop[i]) - partial).max(0.0))
+                            }),
+                            offhand_pop: (f32::from(g.hotbar_pop[9]) - partial).max(0.0),
+                            attack: (indicator == 2).then_some(strength),
+                        };
+                        let draws = hud_layout::hotbar(wi, hi, &inputs);
+                        hud_layout::paint(batch, &g.gui.atlas, &draws);
+                        for d in &draws {
+                            if let hud_layout::GuiDraw::Item { slot, x, y, .. } = *d {
+                                let stack = if slot == 40 {
+                                    g.offhand.as_ref()
+                                } else {
+                                    g.inventory[slot as usize].as_ref()
+                                };
+                                if let Some(stack) = stack {
+                                    g.draw_item(batch, stack, x as f32, y as f32);
+                                }
                             }
                         }
                     }
-                }
-            });
+                });
+                self.touch_follow_hotbar(&mut batch, mark);
+            }
             self.gui_layer("minecraft:effects", &mut batch, |g, batch| {
                 // The PvP & HUD effects widget takes the icons' place.
                 if !g.pvp_effects_shown() {
@@ -4927,9 +4957,13 @@ impl Game<'_> {
                 self.keep_status_rows(&draws, wi, hi);
                 // The rows draw in one pass here, so a mod's `player_health`
                 // layer stands for the armor, food and air rows too.
-                self.gui_layer("minecraft:player_health", &mut batch, |g, batch| {
-                    hud_layout::paint(batch, &g.gui.atlas, &draws);
-                });
+                {
+                    let mark = batch.vertices.len();
+                    self.gui_layer("minecraft:player_health", &mut batch, |g, batch| {
+                        hud_layout::paint(batch, &g.gui.atlas, &draws);
+                    });
+                    self.touch_follow_hotbar(&mut batch, mark);
+                }
                 // Hud.playAirBubblePoppedSound: Player.playSound (PLAYERS), heard
                 // by this client only.
                 if let Some((volume, pitch)) = self.health_hud.bubble_pop_sound.take() {
@@ -4944,46 +4978,54 @@ impl Game<'_> {
                 }
             }
             // After the health rows (Hud.extractHotbarAndDecorations): jump, locator or XP bar.
-            self.gui_layer("minecraft:contextual_info_bar", &mut batch, |g, batch| {
-                if contextual == ContextualBar::JumpableVehicle {
-                    g.draw_jump_bar(batch, wi, hi);
-                }
-                if contextual == ContextualBar::Locator {
-                    let (sprite, [x, y, w, h]) = horizon_client::locator_bar::background(wi, hi);
-                    horizon_client::ui::nine_slice(
-                        batch,
-                        &g.gui.atlas,
-                        sprite,
-                        x as f32,
-                        y as f32,
-                        w as f32,
-                        h as f32,
-                        u32::MAX,
-                    );
-                }
-                if has_experience && g.player.is_some() {
-                    let atlas = &g.gui.atlas;
-                    let width = |s: &str| HudBatch::text_width(atlas, s) as i32;
-                    let draws = hud_layout::experience_colored(
-                        g.pack.polytone_colors.xp_bar,
-                        wi,
-                        hi,
-                        g.experience.progress,
-                        g.experience.level,
-                        contextual == ContextualBar::Experience,
-                        &width,
-                    );
-                    hud_layout::paint(batch, atlas, &draws);
-                }
-                if contextual == ContextualBar::Locator {
-                    let draws = g.locator_bar_draws(wi, hi);
-                    hud_layout::paint(batch, &g.gui.atlas, &draws);
-                }
-            });
-            if !spectator {
-                self.gui_layer("minecraft:selected_item_name", &mut batch, |g, batch| {
-                    g.draw_selected_name(batch, !g.creative);
+            {
+                let mark = batch.vertices.len();
+                self.gui_layer("minecraft:contextual_info_bar", &mut batch, |g, batch| {
+                    if contextual == ContextualBar::JumpableVehicle {
+                        g.draw_jump_bar(batch, wi, hi);
+                    }
+                    if contextual == ContextualBar::Locator {
+                        let (sprite, [x, y, w, h]) = horizon_client::locator_bar::background(wi, hi);
+                        horizon_client::ui::nine_slice(
+                            batch,
+                            &g.gui.atlas,
+                            sprite,
+                            x as f32,
+                            y as f32,
+                            w as f32,
+                            h as f32,
+                            u32::MAX,
+                        );
+                    }
+                    if has_experience && g.player.is_some() {
+                        let atlas = &g.gui.atlas;
+                        let width = |s: &str| HudBatch::text_width(atlas, s) as i32;
+                        let draws = hud_layout::experience_colored(
+                            g.pack.polytone_colors.xp_bar,
+                            wi,
+                            hi,
+                            g.experience.progress,
+                            g.experience.level,
+                            contextual == ContextualBar::Experience,
+                            &width,
+                        );
+                        hud_layout::paint(batch, atlas, &draws);
+                    }
+                    if contextual == ContextualBar::Locator {
+                        let draws = g.locator_bar_draws(wi, hi);
+                        hud_layout::paint(batch, &g.gui.atlas, &draws);
+                    }
                 });
+                self.touch_follow_hotbar(&mut batch, mark);
+            }
+            if !spectator {
+                {
+                    let mark = batch.vertices.len();
+                    self.gui_layer("minecraft:selected_item_name", &mut batch, |g, batch| {
+                        g.draw_selected_name(batch, !g.creative);
+                    });
+                    self.touch_follow_hotbar(&mut batch, mark);
+                }
             }
         }
         // Hud.extractSleepOverlay: over all health/food bars, under titles and chat.
@@ -9037,7 +9079,7 @@ impl Game<'_> {
                     }
                 }
                 WindowEvent::Resized(size) => {
-                    if let Some(r) = &mut self.renderer {
+                    if !cfg!(target_os = "ios") && let Some(r) = &mut self.renderer {
                         r.resize(size.width, size.height);
                     }
                 }
@@ -9222,7 +9264,7 @@ impl Game<'_> {
                     horizon_client::preedit::set_preedit(None)
                 }
                 WindowEvent::Resized(size) => {
-                    if let Some(r) = &mut self.renderer {
+                    if !cfg!(target_os = "ios") && let Some(r) = &mut self.renderer {
                         r.resize(size.width, size.height);
                     }
                     self.observe_fullscreen();
@@ -10519,6 +10561,7 @@ impl<'a> Game<'a> {
             unclaimed_modifiers: None,
             focus_after_run: None,
             ime_allowed: false,
+            soft_keyboard: ios_keyboard::SoftKeyboard::default(),
             ime_area: None,
             focus_lost: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
