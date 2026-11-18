@@ -506,7 +506,8 @@ impl Game<'_> {
             self.native_input.mappings.release_all();
             self.keys.release_source(horizon_client::held::Source::Mod);
         }
-        let (framebuffer, gui) = self.gui_frame_now();
+        let (framebuffer, mut gui) = self.gui_frame_now();
+        gui.size[1] = self.chat_height(gui.size[1] as f32, gui.scale as f32) as u32;
         let identity = self
             .title
             .as_ref()
