@@ -14,7 +14,7 @@ impl Game<'_> {
         if self.dialog_open() {
             return self.dialog_has_text_field();
         }
-        if self.title_input_active()
+        if super::control::title_owns_text(&self.screen, self.title.is_some())
             && let Some(title) = self.title.as_mut()
         {
             // A caret field, an append-only one (`focused_field`), or a game
@@ -46,7 +46,13 @@ impl Game<'_> {
 
     /// Allow the input method only while a text box has focus.
     pub(super) fn sync_ime(&mut self) {
-        let want = self.text_field_focused();
+        horizon_client::screen_keyboard::watch();
+        let focused = self.text_field_focused();
+        if !focused {
+            self.soft_keyboard.away = false;
+            self.soft_keyboard.row = None;
+        }
+        let want = focused && !self.soft_keyboard.away;
         if want != self.ime_allowed
             && let Some(window) = &self.window
         {
@@ -167,7 +173,7 @@ impl Game<'_> {
         if self.dialog_type(text) {
             return;
         }
-        if self.title_input_active() {
+        if super::control::title_owns_text(&self.screen, self.title.is_some()) {
             self.title_edit(Some(text), false);
         } else if self.book.is_some() {
             self.book_input(None, Some(text));
