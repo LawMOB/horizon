@@ -1558,6 +1558,7 @@ pub(crate) enum Act {
     PvpPreset,
     /// PvP & HUD's Edit HUD button.
     HudEditor,
+    EditTouchControls,
     /// A native mod's key (mod, key) waits for a key; a button of its page.
     /// A key a native mod registered (mod, mapping) waits for a key, or is reset.
     ModKey(usize, usize),
@@ -1699,6 +1700,7 @@ pub enum Event {
     /// Data Packs' Open Pack Folder: create the folder if needed and open it.
     OpenDataPackFolder(std::path::PathBuf),
     OpenModFolder,
+    EditTouchControls,
     /// A link on the Mods screen (Homepage, Issues, a license): confirm and open it.
     OpenLink(String),
     /// A click on the Mods screen's mod id or version: copy it.
@@ -2966,6 +2968,20 @@ impl OptionsUi {
                 )];
                 let controls = vanilla_control_options();
                 rows.extend(pairs(&controls));
+                // The touch controls' layout editor (iOS): move, resize and hide
+                // them, add buttons and bind keys to them.
+                if cfg!(target_os = "ios") {
+                    rows.push(Row::Buttons(
+                        button(
+                            0.0,
+                            0.0,
+                            310.0,
+                            tr("horizon.pages.open.touch_controls"),
+                            Act::EditTouchControls,
+                        ),
+                        None,
+                    ));
+                }
                 // Horizon's controller page, after vanilla's rows.
                 rows.push(Row::Buttons(
                     button(
@@ -3517,6 +3533,7 @@ impl OptionsUi {
                             events.push(Event::Changed);
                         }
                         Act::HudEditor => events.push(Event::HudEditor),
+                        Act::EditTouchControls => events.push(Event::EditTouchControls),
                         Act::AccessibilityHelp => events.push(Event::AccessibilityHelp),
                         Act::Credits => events.push(Event::Credits),
                         Act::CopyAgentDetails => events.push(Event::CopyAgentDetails),
@@ -4568,6 +4585,7 @@ impl OptionsUi {
                             events.push(Event::Changed);
                         }
                         Act::HudEditor => events.push(Event::HudEditor),
+                        Act::EditTouchControls => events.push(Event::EditTouchControls),
                         Act::AccessibilityHelp => events.push(Event::AccessibilityHelp),
                         Act::Credits => events.push(Event::Credits),
                         Act::CopyAgentDetails => events.push(Event::CopyAgentDetails),
@@ -7686,7 +7704,7 @@ mod tests {
                     o => format!("{o:?}"),
                 };
                 // macOS has one graphics API: the graphics screen leaves the row out.
-                if id == "graphics-api" && cfg!(target_os = "macos") {
+                if id == "graphics-api" && cfg!(target_vendor = "apple") {
                     continue;
                 }
                 assert!(
