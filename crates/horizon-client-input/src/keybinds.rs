@@ -298,12 +298,24 @@ pub use horizon_client_core::key_display::{
     reset_action_bindings, set_action_binding, set_action_resolver,
 };
 
+/// The unmodified layout key when the window backend exposes it.
+#[cfg(not(target_os = "ios"))]
+pub fn layout_key(event: &winit::event::KeyEvent) -> winit::keyboard::Key {
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    event.key_without_modifiers()
+}
+
+/// iOS supplies a logical key without the layout modifier supplement.
+#[cfg(target_os = "ios")]
+pub fn layout_key(event: &winit::event::KeyEvent) -> winit::keyboard::Key {
+    event.logical_key.clone()
+}
+
 /// A key event: what the layout writes on its key, without modifiers, names
 /// that key from now on (`key_display::learn_layout`), so an AZERTY player's
 /// Q key shows A.
 pub fn learn_layout(event: &winit::event::KeyEvent) {
     use winit::keyboard::{Key, PhysicalKey};
-    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
     let PhysicalKey::Code(code) = event.physical_key else {
         return;
     };
@@ -311,7 +323,7 @@ pub fn learn_layout(event: &winit::event::KeyEvent) {
         return;
     };
     let learn = horizon_client_core::key_display::learn_layout;
-    match event.key_without_modifiers() {
+    match layout_key(event) {
         Key::Character(text) => learn(name, &text),
         Key::Dead(Some(c)) => learn(name, c.encode_utf8(&mut [0; 4])),
         _ => {}
@@ -356,6 +368,7 @@ pub fn layout_key_name(
 /// doesn't identify; 0 when there is neither. Stable within a platform only.
 pub fn raw_key_code(physical: winit::keyboard::PhysicalKey) -> u32 {
     use winit::keyboard::{NativeKeyCode, PhysicalKey};
+    #[cfg(not(target_os = "ios"))]
     use winit::platform::scancode::PhysicalKeyExtScancode;
     match physical {
         PhysicalKey::Unidentified(native) => match native {
@@ -363,7 +376,10 @@ pub fn raw_key_code(physical: winit::keyboard::PhysicalKey) -> u32 {
             NativeKeyCode::MacOS(c) | NativeKeyCode::Windows(c) => c.into(),
             NativeKeyCode::Unidentified => 0,
         },
+        #[cfg(not(target_os = "ios"))]
         PhysicalKey::Code(_) => physical.to_scancode().unwrap_or(0),
+        #[cfg(target_os = "ios")]
+        PhysicalKey::Code(_) => 0,
     }
 }
 
