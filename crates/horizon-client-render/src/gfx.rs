@@ -517,6 +517,7 @@ mod screenshot;
 pub use screenshot::{PendingScreenshot, ScreenshotSave};
 mod screenshot_readback;
 mod stars;
+mod ios_surface;
 mod surface_setup;
 use surface_setup::{AdapterChoice, AdapterFailure, open_adapter, pick_adapter, set_up_surface};
 mod off_page;
@@ -2351,7 +2352,7 @@ impl Renderer {
         let info = adapter.get_info();
         surface_setup::log_sprite_split(&info, split, layers);
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
-        let size = window.inner_size();
+        let size = ios_surface::surface_size(&window);
         let max_side = device.limits().max_texture_dimension_2d;
         let configured = match (&surface, configured) {
             (Some(_), Some(configured)) => Some(configured),
