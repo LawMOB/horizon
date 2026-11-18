@@ -50,6 +50,7 @@ pub(super) struct StartupMenu {
     /// the screen it leaves (`Screen.clearFocus`).
     focus_screen: u64,
     pub pending: Option<PendingWorldEntry>,
+    edit_touch: bool,
     pub reload_packs: bool,
     /// Browse mods' worker (`mod_browser`).
     mod_jobs: super::mod_browser::Jobs,
@@ -180,6 +181,9 @@ impl StartupMenu {
             game.set_screen(Screen::Options);
             game.options_from_title = true;
             game.dragging = self.dragging;
+        }
+        if std::mem::take(&mut self.edit_touch) {
+            game.open_touch_editor();
         }
         if let Some(focus) = self.key_focus.take() {
             game.key_focus_adopt(focus, self.key_slider_edit);
@@ -660,6 +664,7 @@ impl Loading {
                     let _ = std::fs::create_dir_all(&dir);
                     packs::open_folder(&dir);
                 }
+                Event::EditTouchControls => self.menu.edit_touch = true,
                 Event::OpenModFolder => {
                     let dir = Game::game_dir().join(horizon_client::mod_list::DIR);
                     let _ = std::fs::create_dir_all(&dir);
@@ -1093,6 +1098,22 @@ impl Loading {
         self.menu.key_synthetic = was;
     }
 
+    #[cfg(target_os = "ios")]
+    pub(super) fn sync_menu_ime(&mut self) {
+        let want = if self.menu.options_open {
+            self.menu.options.typing()
+        } else {
+            self.menu.title.as_mut().is_some_and(|title| {
+                title.has_caret_field() || title.focused_field().is_some()
+            })
+        };
+        if want != self.ime_allowed && let Some(window) = &self.window {
+            horizon_client::screen_keyboard::watch();
+            self.ime_allowed = want;
+            window.set_ime_allowed(want);
+        }
+    }
+
     pub(super) fn menu_event(
         &mut self,
         event_loop: &dyn EventLoopCtl,
@@ -1148,7 +1169,9 @@ impl Loading {
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
-                    r.resize(size.width, size.height);
+                    if !cfg!(target_os = "ios") {
+                        r.resize(size.width, size.height);
+                    }
                 }
                 self.apply_menu_settings();
             }
@@ -1337,6 +1360,12 @@ impl Loading {
                             event.text.as_deref(),
                         );
                         self.menu_option_events(events);
+                    } else if cfg!(target_os = "ios")
+                        && !handled
+                        && matches!(event.physical_key, PhysicalKey::Unidentified(_))
+                        && let Some(text) = event.text.as_deref()
+                    {
+                        self.menu.options.type_text(atlas, text);
                     }
                 } else {
                     let batch = HudBatch::new(self.menu_size(), self.settings.gui_scale_inputs());
@@ -1568,6 +1597,8 @@ mod tests {
             shown: false,
             ui_at: None,
             title_drawn: false,
+            #[cfg(target_os = "ios")]
+            ime_allowed: false,
             menu: StartupMenu::default(),
             error: None,
         }
