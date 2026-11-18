@@ -27,6 +27,15 @@ pub fn prepare() -> Startup {
     horizon_mod_package::holder::enter();
     let result: crate::Result<_> = (|| {
         let mut command = std::process::Command::new(std::env::current_exe()?);
+        // The app launches outside its writable Documents directory.
+        #[cfg(target_os = "ios")]
+        {
+            let app_home = std::env::var_os("HOME").ok_or("missing iOS app home")?;
+            let documents = std::path::Path::new(&app_home).join("Documents");
+            std::fs::create_dir_all(&documents)?;
+            std::env::set_current_dir(&documents)?;
+            command.env("HORIZON_HOME", documents);
+        }
         command.args(std::env::args_os().skip(1));
         let launch = LaunchArguments::for_command(&command)?;
         let options = game::Options::validate(launch.clone())?;
