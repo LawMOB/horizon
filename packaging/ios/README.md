@@ -1,5 +1,3 @@
-:::writing{variant=“document” title=“Horizon for iOS” id=“82519”}
-
 Horizon for iOS
 
 The iOS build workflow in the Actions tab builds Horizon.ipa for iPhone and iPad. Run the workflow manually, then download the Horizon-ios artifact. Install the IPA using Sideloadly or AltStore; these tools sign the application using your Apple ID.
@@ -15,4 +13,3 @@ IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --locked --profile ios \
 packaging/ios/package.sh target/aarch64-apple-ios/ios/horizon-client 0.1.0 dist
 
 The layout editor is available under Options → Controls → Custom Controls.
-:::
