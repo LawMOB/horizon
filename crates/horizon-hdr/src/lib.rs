@@ -87,7 +87,7 @@ pub fn set_metadata(device: &wgpu::Device, surface: &wgpu::Surface<'_>, peak: f3
         // Safety: a live swapchain of this device, one metadata entry for it.
         unsafe { loader.set_hdr_metadata(&[swapchain], &[metadata(peak, black)]) };
     }
-    ##[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     let _ = (device, surface, peak, black);
 }
 
