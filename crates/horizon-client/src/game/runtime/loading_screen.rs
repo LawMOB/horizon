@@ -348,6 +348,8 @@ impl Loading {
             }
         }
         let renderer_at = Instant::now();
+        #[cfg(target_os = "ios")]
+        log::info!("Horizon iOS handoff: building world renderer");
         let renderer = startup::time("renderer.world", || {
             build_renderer(
                 window.clone(),
@@ -377,11 +379,15 @@ impl Loading {
         );
         let renderer_ms = renderer_at.elapsed().as_millis();
         // Audio is created on the main thread, after the core is ready.
+        #[cfg(target_os = "ios")]
+        log::info!("Horizon iOS handoff: initializing audio");
         let audio = if !options.execution_role.is_client() {
             Audio::silent(&loaded.pack.source)
         } else {
             Audio::with_device(&loaded.pack.source, &self.settings.sound_device)
         };
+        #[cfg(target_os = "ios")]
+        log::info!("Horizon iOS handoff: audio initialized; preparing game");
         // The menu read its language from the prepared root alone (`set_root`) and
         // `load_resources` skips it on this path: read it again with the mods' layers, in the
         // language picked in the menu.
