@@ -13,7 +13,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 /// loop spinning indefinitely. Offscreen frames are driven by the loop itself.
 pub(super) fn redraw_flow(frame_drawn: &mut bool, offscreen: bool, now: Instant) -> ControlFlow {
     let drew_frame = std::mem::take(frame_drawn);
-    if offscreen || drew_frame {
+    if cfg!(target_os = "ios") {
+        ControlFlow::WaitUntil(now + Duration::from_millis(16))
+    } else if offscreen || drew_frame {
         ControlFlow::Poll
     } else {
         ControlFlow::WaitUntil(now + Duration::from_millis(16))
