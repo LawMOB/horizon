@@ -218,6 +218,20 @@ pub(super) struct WorldRestLoader {
 }
 
 impl WorldRestLoader {
+    /// Joins only a finished producer, leaving the event loop free to draw and
+    /// process input while the remaining resource tables load.
+    pub(super) fn poll(slot: &mut Option<Self>) -> Result<bool> {
+        if let Some(loader) = slot.as_ref()
+            && !loader.ready()?
+        {
+            return Ok(false);
+        }
+        if let Some(loader) = slot.take() {
+            loader.finish()?;
+        }
+        Ok(true)
+    }
+
     pub(super) fn ready(&self) -> Result<bool> {
         // No time limit: the title stays usable while this loads, and a slow
         // disk or a debug build can take minutes. A failure ends the thread
