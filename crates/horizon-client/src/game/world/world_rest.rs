@@ -80,7 +80,8 @@ pub(super) fn load_world_rest(
             registry,
             visibility,
             resources.item_defaults(),
-        )?;
+        )
+        .map_err(|error| format!("block entity resources at {}: {error}", root.display()))?;
         renderer.add_mod_signs(facts, registry);
         Ok(renderer)
     };
@@ -278,6 +279,10 @@ pub(super) fn load_world_rest(
             }),
         )
     };
+    // Validate fallible tables before announcing successful completion. These
+    // errors used to surface only while assembling WorldRest after that log.
+    let block_entity_render = block_entity_render?;
+    let behaviours = behaviours?;
     let (items, recipes, stations) = items?;
     let (animate, fog) = animate?;
     let (mob_types, mob_data) = mobs?;
@@ -293,25 +298,27 @@ pub(super) fn load_world_rest(
         threads
     );
     progress.set(8);
-    Ok(WorldRest {
+    let rest = WorldRest {
         stations,
         items,
         recipes,
         transformers,
         providers,
-        block_entity_render: block_entity_render?,
+        block_entity_render,
         animate,
         fog,
         music,
         ambient,
         nether_environment,
         end_environment,
-        behaviours: behaviours?,
+        behaviours,
         mob_types,
         mob_data,
         player_type,
         player_arm,
         player_arm_slim,
         spin_attack,
-    })
+    };
+    log::info!("Horizon: world resource tables assembled; releasing loader scratch data");
+    Ok(rest)
 }
