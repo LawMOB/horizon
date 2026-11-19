@@ -286,7 +286,13 @@ impl Loading {
                 w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::Poll);
+        if cfg!(target_os = "ios") {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(16),
+            ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        }
     }
     pub(super) fn draw(&mut self) {
         let Some(size) = self
