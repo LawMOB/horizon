@@ -88,6 +88,20 @@ impl Loading {
     /// the title is on the screen holds the title back by that build. Wait for
     /// one title frame first, unless a world is waiting to open.
     pub(super) fn ready_for_handoff(&self) -> bool {
+        // A failed iOS generation stays on its error dialog until a resource
+        // reload replaces it; exit() cannot stop UIKit's event loop.
+        #[cfg(target_os = "ios")]
+        if matches!(&self.loaded, Some(Err(_))) {
+            return false;
+        }
+        // Initial client setup joins the world resources before publishing models.
+        // Keep running the menu until poll_menu_resources has joined the finished
+        // producer; never enter that synchronous wait from a window callback.
+        if let Some(Ok(loaded)) = &self.loaded
+            && loaded.rest_loader.is_some()
+        {
+            return false;
+        }
         self.title_drawn
             || self.menu.pending.is_some()
             || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT)
@@ -272,9 +286,14 @@ impl Loading {
             return;
         }
         if let Err(error) = self.poll_menu_resources() {
-            self.error = Some(error);
-            event_loop.exit();
-            return;
+            #[cfg(target_os = "ios")]
+            self.show_startup_resource_error(&error.to_string());
+            #[cfg(not(target_os = "ios"))]
+            {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
         }
         self.poll_menu_realms(event_loop);
         #[cfg(target_os = "ios")]
@@ -286,13 +305,7 @@ impl Loading {
                 w.request_redraw();
             }
         }
-        if cfg!(target_os = "ios") {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Poll);
-        }
+        event_loop.set_control_flow(ControlFlow::Poll);
     }
     pub(super) fn draw(&mut self) {
         let Some(size) = self
@@ -525,6 +538,7 @@ impl ApplicationHandler for App {
             Step::Ready(game) => *self = App::Ready(game),
             Step::Done => event_loop.exit(),
             Step::Failed(e) => {
+                log::error!("Horizon: startup handoff failed: {e}");
                 if let App::Loading(loading) = self {
                     loading.error = Some(e);
                 }
