@@ -1491,7 +1491,16 @@ impl Audio {
         Self::with_device(root, "")
     }
     pub fn with_device(root: &ResourceSource, device_name: &str) -> Self {
-        Self::with_output(root, true, device_name)
+        #[cfg(target_os = "ios")]
+        {
+            let _ = device_name;
+            log::warn!("Horizon iOS diagnostic: audio output disabled to isolate the menu freeze");
+            Self::silent(root)
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            Self::with_output(root, true, device_name)
+        }
     }
     /// No output device: the dedicated server.
     pub fn silent(root: &ResourceSource) -> Self {
