@@ -462,6 +462,10 @@ impl Loading {
                 match self.receiver.try_recv() {
                     Ok(LoaderMsg::Ui(gui, root)) => self.set_ui(gui, root),
                     Ok(LoaderMsg::Done(result)) => {
+                        #[cfg(target_os = "ios")]
+                        if let Err(error) = &result {
+                            self.show_startup_resource_error(error);
+                        }
                         self.loaded = Some(result);
                         self.delivered = true;
                         break;
@@ -481,9 +485,36 @@ impl Loading {
                 }
             }
         }
+        let world_result = match &mut self.loaded {
+            Some(Ok(loaded)) => WorldRestLoader::poll(&mut loaded.rest_loader),
+            _ => Ok(true),
+        };
+        if let Err(error) = world_result {
+            #[cfg(target_os = "ios")]
+            {
+                let message = error.to_string();
+                self.show_startup_resource_error(&message);
+            }
+            #[cfg(not(target_os = "ios"))]
+            return Err(error);
+        }
         self.drive_menu_mod_browser();
         self.restart_menu_resources()
     }
+
+    // iOS cannot terminate its event loop to report a startup failure. Keep the
+    // menu drawing and use its existing resource-error dialog instead.
+    #[cfg(any(target_os = "ios", test))]
+    pub(super) fn show_startup_resource_error(&mut self, message: &str) {
+        log::error!("Horizon: startup resource load failed: {message}");
+        self.loaded = Some(Err(message.to_owned()));
+        self.delivered = true;
+        self.menu.reload_packs = false;
+        self.menu.pending = None;
+        self.open_menu_options(Page::Packs);
+        self.menu.options.resource_error = Some(message.to_owned());
+    }
+
     /// The startup menu's Browse mods, as `Game::drive_mod_browser`.
     fn drive_menu_mod_browser(&mut self) {
         let menu = &mut self.menu;
@@ -1907,6 +1938,31 @@ mod tests {
             if address == "localhost:25565" && name == "Guest")
         );
         assert!(menu.pending.take().is_none(), "an entry is consumed once");
+    }
+
+    #[test]
+    fn a_startup_resource_failure_cancels_entry_and_draws_its_error() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut loading = loading(receiver);
+        let root = std::env::temp_dir().join("horizon-startup-resource-error");
+        loading.gui = Some(gui(&root));
+        loading.menu.pending = Some(PendingWorldEntry::StudioReplay(root));
+        loading.show_startup_resource_error("missing entity-models.json");
+        assert!(loading.menu.pending.is_none());
+        assert!(loading.menu.options_open);
+        assert_eq!(
+            loading.menu.options.resource_error.as_deref(),
+            Some("missing entity-models.json")
+        );
+        assert!(loading.error.is_none());
+        assert!(
+            matches!(&loading.loaded, Some(Err(error)) if error == "missing entity-models.json")
+        );
+        #[cfg(target_os = "ios")]
+        assert!(!loading.ready_for_handoff());
+        let mut batch = HudBatch::scratch([1280, 720]);
+        loading.draw_menu(&mut batch);
+        assert!(!batch.vertices.is_empty());
     }
 
     #[test]
