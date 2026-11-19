@@ -789,7 +789,11 @@ pub(super) fn load_resources(
                     started,
                     true,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    log::error!("Horizon: world resource worker failed: {error}");
+                    error.to_string()
+                })?;
+                log::info!("Horizon: world resource tables returned; publishing shared resources");
                 resources
                     .rest
                     .set(rest)
