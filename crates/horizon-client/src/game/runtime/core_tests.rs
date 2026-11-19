@@ -886,13 +886,26 @@ fn world_rest_poll_does_not_wait_for_a_blocked_worker() {
     let loader = WorldRestLoader {
         progress: Progress::new(),
         handle: std::thread::spawn(move || {
-            wait.recv().unwrap();
+            wait.recv_timeout(Duration::from_secs(2))
+                .map_err(|error| error.to_string())?;
             Ok(())
         }),
     };
-    assert!(!loader.ready().unwrap());
+    let mut pending = Some(loader);
+    // Keep the producer blocked until poll returns: an unconditional join here
+    // would stop the window instead of returning to its event loop.
+    let waiting = WorldRestLoader::poll(&mut pending).unwrap();
+    let retained = pending.is_some();
     release.send(()).unwrap();
-    loader.finish().unwrap();
+    while !pending.as_ref().unwrap().ready().unwrap() {
+        std::thread::yield_now();
+    }
+    let completed = WorldRestLoader::poll(&mut pending).unwrap();
+    assert!(!waiting);
+    assert!(retained);
+    assert!(completed);
+    assert!(pending.is_none());
+    assert!(WorldRestLoader::poll(&mut pending).unwrap());
 }
 
 #[test]
@@ -920,10 +933,15 @@ fn world_rest_worker_failure_reaches_the_client() {
         progress: Progress::new(),
         handle: std::thread::spawn(|| Err("missing world table".to_owned())),
     };
+    let mut pending = Some(loader);
+    while !pending.as_ref().unwrap().ready().unwrap() {
+        std::thread::yield_now();
+    }
     assert_eq!(
-        loader.finish().unwrap_err().to_string(),
+        WorldRestLoader::poll(&mut pending).unwrap_err().to_string(),
         "missing world table"
     );
+    assert!(pending.is_none());
 }
 
 #[test]
