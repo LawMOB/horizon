@@ -171,15 +171,7 @@ impl Game<'_> {
     }
 
     pub(super) fn poll_world_rest(&mut self) -> Result<()> {
-        if let Some(loader) = &self.rest_loader
-            && loader.ready()?
-        {
-            self.rest_loader
-                .take()
-                .ok_or("missing world loader")?
-                .finish()?;
-        }
-        Ok(())
+        WorldRestLoader::poll(&mut self.rest_loader).map(|_| ())
     }
 
     // ---- the world's data packs' content tables ---------------------------
