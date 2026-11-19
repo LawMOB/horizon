@@ -44,7 +44,7 @@ impl Marker {
         // Endpoint::bind checks /tmp and every ancestor and creates a 0700 leaf
         // with exclusive mkdir, rejecting collisions rather than reusing anything.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let fallback = "/private/tmp"; // /tmp is a symlink on macOS and iOS.
+        let fallback = "/private/tmp"; // /tmp is a symlink on macOS.
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let fallback = "/tmp";
         Self::new(std::path::Path::new(fallback).join(name))
