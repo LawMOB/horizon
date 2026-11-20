@@ -2,6 +2,7 @@
 //! (`GameCpuResources`, `EntityModels`), what the background loader publishes (`Loaded`,
 //! `LoaderMsg`), the world's rest loader and a pending world entry, the ordinary launch
 //! (`run_loading`) and the smoke run's report (`write_report`).
+use super::loading_screen::BigStack;
 use super::*;
 
 /// CPU-only startup data, owned by one loader generation. No file reads or
@@ -220,6 +221,21 @@ pub(super) struct WorldRestLoader {
 }
 
 impl WorldRestLoader {
+    /// Joins only a finished producer, leaving the event loop free to draw and
+    /// process input while the remaining resource tables load.
+    #[cfg(any(target_os = "ios", test))]
+    pub(super) fn poll(slot: &mut Option<Self>) -> Result<bool> {
+        if let Some(loader) = slot.as_ref()
+            && !loader.ready()?
+        {
+            return Ok(false);
+        }
+        if let Some(loader) = slot.take() {
+            loader.finish()?;
+        }
+        Ok(true)
+    }
+
     pub(super) fn ready(&self) -> Result<bool> {
         // No time limit: the title stays usable while this loads, and a slow
         // disk or a debug build can take minutes. A failure ends the thread
@@ -291,11 +307,13 @@ pub(super) fn run_loading(
         shown: false,
         ui_at: None,
         title_drawn: false,
+        #[cfg(target_os = "ios")]
+        ime_allowed: false,
         menu,
         error: None,
     };
     let mut app = App::Loading(Box::new(loading));
-    let result = EventLoop::new()?.run_app(&mut app);
+    let result = EventLoop::new()?.run_app(&mut BigStack(&mut app));
     narrator::stop();
     match &mut app {
         // Ready: splitscreen around P1's game.
