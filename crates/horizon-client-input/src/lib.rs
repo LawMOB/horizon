@@ -2,7 +2,8 @@
 //! names, toggle keys, mouse settings, controllers, the clipboard and window
 //! options. horizon-client re-exports each module under its old path
 //! (`horizon_client::keybinds`, ...).
-#![forbid(unsafe_code)]
+#![cfg_attr(not(target_os = "ios"), forbid(unsafe_code))]
+#![cfg_attr(target_os = "ios", deny(unsafe_code))]
 pub mod actions;
 pub mod clipboard;
 pub mod gamepad;
@@ -18,5 +19,7 @@ pub mod keymapping;
 pub mod modifiers;
 pub mod mouse;
 pub mod radial;
+pub mod screen_keyboard;
 pub mod snap;
+pub mod touch;
 pub mod window;
