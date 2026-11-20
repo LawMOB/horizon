@@ -53,7 +53,11 @@ impl NoResources {
             }
             None => (
                 lang::get("horizon.no_resources.title"),
-                vec![lang::get("horizon.no_resources.prepare")],
+                vec![lang::get(if cfg!(target_os = "ios") {
+                    "horizon.no_resources.ios"
+                } else {
+                    "horizon.no_resources.prepare"
+                })],
                 vec![quit],
             ),
         };
