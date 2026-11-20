@@ -56,6 +56,21 @@ pub(super) struct Pads {
     devices: hardware::Devices,
     /// The virtual pad of `horizon-ctl pad`.
     injected: PadState,
+    /// The on-screen touch controls while playing (touch.rs), and the
+    /// virtual pad they hold this iteration.
+    pub(super) touch: horizon_client_input::touch::TouchControls,
+    pub(super) touch_state: PadState,
+    /// The touch Sneak button is pressing the sneak key (touch.rs).
+    pub(super) touch_sneak: bool,
+    /// The keys the touch controls' own buttons hold down (touch.rs).
+    pub(super) touch_keys: Vec<KeyCode>,
+    /// The controls' layout of the last frame, for fingers already down
+    /// (touch.rs).
+    pub(super) touch_layout: Option<(horizon_client_input::touch::Layout, f32)>,
+    /// `touch-controls.txt` was read (touch.rs).
+    pub(super) touch_loaded: bool,
+    /// The finger acting as the mouse over menus.
+    pub(super) touch_mouse: horizon_client_input::touch::TouchMouse,
     /// The virtual pad was in use at the last poll.
     virtual_input: bool,
     /// Buttons a `pad ... tap` releases at the next poll.
@@ -327,10 +342,12 @@ impl Pads {
     /// radial menu swallowed holds nothing, while a sneak held since before the menu opened is
     /// still held through it.
     pub(super) fn holds_action(&self, action: &str) -> bool {
-        Button::ALL.into_iter().any(|button| {
-            self.actions[button as usize].contains(&action)
-                && (self.edges.is_held(button) || self.late_releases.contains(&button))
-        })
+        // The touch Sneak button presses the key itself, like a pad's latch.
+        (action == "key.sneak" && self.touch_sneak)
+            || Button::ALL.into_iter().any(|button| {
+                self.actions[button as usize].contains(&action)
+                    && (self.edges.is_held(button) || self.late_releases.contains(&button))
+            })
     }
 
     /// A new player entity took over (spawn, respawn, a server joined, a
@@ -376,7 +393,11 @@ impl Game<'_> {
 
     /// Once per loop iteration: read the pads and act on button changes.
     pub(super) fn poll_pads(&mut self, event_loop: &dyn EventLoopCtl) {
-        self.pad.virtual_input = self.pad.injected != PadState::default();
+        self.touch_frame();
+        // The touch controls are live while a finger holds one of them, with or
+        // without controller support: they are not a controller.
+        let touch_live = self.pad.touch_state != PadState::default();
+        self.pad.virtual_input = self.pad.injected != PadState::default() || touch_live;
         let context = self.pad_context();
         if let Some(old) = self.pad.context.filter(|old| *old != context) {
             if old.screen != context.screen {
@@ -385,7 +406,8 @@ impl Game<'_> {
             self.pad_cancel_inputs(event_loop);
         }
         self.pad.context = Some(context);
-        if !self.settings.controller.enabled {
+        let pad_on = self.settings.controller.enabled;
+        if !pad_on && !touch_live {
             self.pad_output_off();
             self.pad_cancel_inputs(event_loop);
             // The radial menu closed with the pad: its overlay fades out, as for a cancel.
@@ -399,6 +421,8 @@ impl Game<'_> {
             return;
         }
         let hardware = match self.pad.feed {
+            // Controller support is off: only the touch controls act.
+            _ if !pad_on => PadState::default(),
             // A scripted run leaves the person's pad at rest and unread, as the window drops
             // their keys and mouse: a read makes a newly touched pad the active one, which lets
             // go of the run's A held in a menu. A held button lets go as the run starts and is
@@ -431,8 +455,17 @@ impl Game<'_> {
         }
         self.ui.options.pad_glyphs = Glyphs::of(&self.settings.controller, self.pad.style);
         self.ui.options.pad_driving = self.pad.in_use && self.pad_focus_mode();
-        let mut state = hardware.merge(&self.pad.injected);
-        let activity = self.pad.activity.observe(&state, &self.settings.controller);
+        // Only a pad's own state says a pad is in use. The touch controls press
+        // the same buttons and push the same stick, but joining them after
+        // this keeps the game from taking a finger for a controller (the pad
+        // cursor and glyphs in the menus, rumble, the focus navigation).
+        let pad_state = if pad_on {
+            hardware.merge(&self.pad.injected)
+        } else {
+            hardware
+        };
+        let activity = self.pad.activity.observe(&pad_state, &self.settings.controller);
+        let mut state = pad_state.merge(&self.pad.touch_state);
         for (i, (stick, deadzone)) in [
             (&mut state.left, self.settings.controller.move_deadzone),
             (&mut state.right, self.settings.controller.look_deadzone),
@@ -804,7 +837,8 @@ impl Game<'_> {
     /// The left stick as the move vector, while playing.
     pub(super) fn pad_move(&self) -> Option<[f32; 2]> {
         let settings = &self.settings.controller;
-        if !settings.enabled
+        let touch_live = self.pad.touch_state != PadState::default();
+        if (!settings.enabled && !touch_live)
             || self.pad_in_menu()
             || !self.pad_focused()
             || (self.pad_radial_captures() && self.pad_radial_selects(0))
