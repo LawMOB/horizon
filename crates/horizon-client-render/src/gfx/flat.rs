@@ -28,6 +28,23 @@ use binding_cache::BindingKey;
 /// `QUADS` for a solid draw; phase 2: its entry in phase 2's draws), base
 /// vertex, first index in the list (phase 2: its draw call in phase 2).
 type Range = [u32; 4];
+const REUSED_BLOCK_IDS: usize = (1 << 20) / std::mem::size_of::<u32>();
+
+/// The last solid index dispatch's exact inputs. Sorted indices change in
+/// place, and phase 2 depends on GPU visibility, so neither is cached here.
+#[derive(Default)]
+struct QuadIndices(Vec<Range>);
+
+impl QuadIndices {
+    fn reuse(&mut self, ranges: &[Range], destination_replaced: bool) -> bool {
+        if !destination_replaced && self.0.as_slice() == ranges {
+            return true;
+        }
+        self.0.clear();
+        self.0.extend_from_slice(ranges);
+        false
+    }
+}
 
 /// Where a group of ranges takes its indices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +148,8 @@ pub struct Flat {
     origins: wgpu::Buffer,
     origin_capacity: u64,
     origin_data: Vec<[f32; 4]>,
+    quad_indices: QuadIndices,
+    block_ids: Vec<u32>,
     /// The frame's index list.
     pub indices: wgpu::Buffer,
     index_capacity: u64,
@@ -584,6 +603,8 @@ impl Flat {
             origins: buffer(device, "Section origins by id", 16, storage_usage),
             origin_capacity: 1,
             origin_data: Vec::new(),
+            quad_indices: QuadIndices::default(),
+            block_ids: Vec::new(),
             indices: buffer(
                 device,
                 "Flat section indices",
@@ -661,13 +682,26 @@ impl Flat {
             arena: None,
         });
         let first = start / GRAIN;
-        let ids = vec![id; vertices.div_ceil(GRAIN) as usize];
-        uploads.buffer(
-            encoder,
-            &table.blocks,
-            first * 4,
-            bytemuck::cast_slice(&ids),
-        );
+        let count = vertices.div_ceil(GRAIN) as usize;
+        if count <= REUSED_BLOCK_IDS {
+            self.block_ids.clear();
+            self.block_ids.resize(count, id);
+            uploads.buffer(
+                encoder,
+                &table.blocks,
+                first * 4,
+                bytemuck::cast_slice(&self.block_ids),
+            );
+        } else {
+            // Keep one unusually large mesh from retaining several MiB of CPU scratch.
+            let ids = vec![id; count];
+            uploads.buffer(
+                encoder,
+                &table.blocks,
+                first * 4,
+                bytemuck::cast_slice(&ids),
+            );
+        }
     }
     /// The block table of the page keyed `page`, for tests that read it back.
     #[cfg(test)]
@@ -686,6 +720,7 @@ impl Flat {
         self.free_ids.push(id);
     }
     pub fn clear(&mut self) {
+        self.quad_indices.0.clear();
         self.pages.clear();
         self.groups.clear();
         self.phase2_group = None;
@@ -825,7 +860,8 @@ impl Flat {
                 wgpu::BufferUsages::STORAGE,
             );
         }
-        if total > self.index_capacity {
+        let destination_replaced = total > self.index_capacity;
+        if destination_replaced {
             self.index_capacity = total.next_power_of_two();
             self.indices = buffer(
                 device,
@@ -834,11 +870,30 @@ impl Flat {
                 wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE,
             );
         }
+        let reuse_quads = if cfg!(target_os = "ios")
+            && let Some(&(_, first, count)) =
+                self.segments.iter().find(|(source, ..)| *source == Source::Quads)
+        {
+            self.quad_indices.reuse(
+                &self.range_data[first as usize..(first + count) as usize],
+                destination_replaced,
+            )
+        } else {
+            self.quad_indices.0.clear();
+            false
+        };
+        // Leave the solid ranges on the CPU when they are the only prefix we can skip.
+        let upload_start = match self.segments.as_slice() {
+            [(Source::Quads, _, _), rest @ ..] if reuse_quads => rest
+                .first()
+                .map_or(self.range_data.len(), |&(_, first, _)| first as usize),
+            _ => 0,
+        };
         uploads.buffer(
             encoder,
             &self.ranges,
-            0,
-            bytemuck::cast_slice(&self.range_data),
+            upload_start as u64 * 16,
+            bytemuck::cast_slice(&self.range_data[upload_start..]),
         );
         // Phase 2's calls start empty, each at the start of its room.
         self.phase2_call_data.clear();
@@ -925,6 +980,7 @@ impl Flat {
         let mut groups = 0;
         for &(source, first, count) in &self.segments {
             let sorted = match source {
+                Source::Quads if reuse_quads => continue,
                 Source::Quads => None,
                 Source::Seen => continue,
                 Source::Sorted(page) => Some(sorted_page(page)),
@@ -974,6 +1030,9 @@ impl Flat {
             groups += 1;
         }
         self.groups.truncate(groups);
+        if groups == 0 {
+            return true;
+        }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Flatten section draws"),
             timestamp_writes: timing.and_then(|t| t.compute_writes("Flatten")),
@@ -1309,6 +1368,20 @@ mod tests {
             (0, Some(1)),
         ];
         (draws, pages, 4)
+    }
+
+    #[test]
+    fn solid_indices_survive_unchanged_frames_but_not_relocation_or_buffer_growth() {
+        let mut cache = QuadIndices::default();
+        let before = [[12, QUADS, 0, 0], [24, QUADS, 1024, 12]];
+        let relocated = [[12, QUADS, 0, 0], [24, QUADS, 2048, 12]];
+        let reordered = [[24, QUADS, 2048, 0], [12, QUADS, 0, 24]];
+        assert!(!cache.reuse(&before, false));
+        assert!(cache.reuse(&before, false));
+        assert!(!cache.reuse(&relocated, false));
+        assert!(!cache.reuse(&reordered, false));
+        assert!(cache.reuse(&reordered, false));
+        assert!(!cache.reuse(&reordered, true));
     }
 
     #[test]
