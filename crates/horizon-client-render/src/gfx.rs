@@ -501,6 +501,8 @@ use frame_policy::frame_format;
 use frame_policy::{frame_configuration, hand_depth_store, horizon_tone_curve, overlay_format};
 mod lod;
 mod looks;
+#[cfg(any(test, target_os = "ios"))]
+mod maintenance_governor;
 #[cfg(any(test, feature = "test-support"))]
 pub use looks::PartLooks;
 pub mod mod_pipelines;
@@ -1125,8 +1127,8 @@ impl ShrinkGate {
     }
     /// Whether one may start now: the waits are over, and `compact_arena` copied
     /// nothing this frame (it `left` the whole budget).
-    fn may_start(&self, now: Instant, left: u64) -> bool {
-        left == COMPACT_BUDGET && self.0.is_none_or(|at| now >= at)
+    fn may_start(&self, now: Instant, left: u64, budget: u64) -> bool {
+        left == budget && self.0.is_none_or(|at| now >= at)
     }
 }
 pub struct Frame<'a> {
@@ -1628,6 +1630,8 @@ pub struct Renderer {
     section_copies: Option<wgpu::CommandEncoder>,
     /// Bytes staged in `section_copies`.
     section_copy_bytes: u64,
+    #[cfg(target_os = "ios")]
+    maintenance_governor: Option<maintenance_governor::Governor>,
     /// When a large translucent page may start to shrink (`shrink_translucent`).
     shrink_gate: ShrinkGate,
     /// Whether `lightmap` holds `lightmap_pixels` yet.
@@ -4536,6 +4540,9 @@ impl Renderer {
             section_uploads,
             section_copies: None,
             section_copy_bytes: 0,
+            #[cfg(target_os = "ios")]
+            maintenance_governor: (info.backend == wgpu::Backend::Metal)
+                .then(maintenance_governor::Governor::default),
             shrink_gate: ShrinkGate::default(),
             lightmap_uploaded: false,
             sprite_minimum_size,
@@ -5526,10 +5533,10 @@ impl Renderer {
     /// arena in system memory (video memory full) are slow, so this is what
     /// keeps the terrain in video memory. The section arena's: the large pages
     /// of the translucent arena and the sorted indices are `shrink_translucent`'s.
-    /// Returns what is left of the frame's `COMPACT_BUDGET`.
-    fn compact_arena(&mut self) -> u64 {
-        let mut budget = COMPACT_BUDGET;
-        if self.arena.closing().is_none()
+    /// Returns what is left of the frame's copy budget.
+    fn compact_arena(&mut self, mut budget: u64, may_start: bool) -> u64 {
+        if may_start
+            && self.arena.closing().is_none()
             && let Some(page) = self.arena.sparsest()
         {
             self.arena.close(page);
@@ -5570,7 +5577,7 @@ impl Renderer {
     /// (`left`), and `trim` returns it once empty. One page at a time, vertices
     /// first; only starts wait, a move under way finishes even if terrain comes
     /// again (stopped, the page would stay closed while the new one fills).
-    fn shrink_translucent(&mut self, left: u64) {
+    fn shrink_translucent(&mut self, left: u64, limit: u64, may_start: bool) {
         let Some(vertices) = self.translucent_arena.as_mut() else {
             return; // split off: nothing to shrink
         };
@@ -5580,7 +5587,7 @@ impl Renderer {
             (&mut self.sorted_indices, Part::Indices),
         ];
         if arenas.iter().all(|(arena, _)| arena.closing().is_none()) {
-            if !self.shrink_gate.may_start(now, left) {
+            if !may_start || !self.shrink_gate.may_start(now, left, limit) {
                 return;
             }
             // The next start in a second, or `SHRINK_RETRY` after a try found no room.
@@ -7294,10 +7301,10 @@ impl Renderer {
         debug_assert_eq!(output.encoding, self.hdr.as_ref().map(|hdr| hdr.output));
         // Its steps as spans (HORIZON_SPIKES): each lap names the step that just ended.
         let mut laps = crate::spans::laps();
-        let landing = Instant::now();
+        let started = Instant::now();
         self.land_frame();
         // Waiting for the previous frame (offscreen: at most two on the GPU), not work.
-        let landed = landing.elapsed();
+        let landed = started.elapsed();
         self.queue.take_waited();
         // World frames alone follow the shader pack: the game loads the picked one
         // before it draws one. Title frames draw no terrain and keep the layout
@@ -7310,13 +7317,41 @@ impl Renderer {
         }
         let released = self.arena.trim();
         self.graveyard.add(released);
-        let left = self.compact_arena();
+        #[cfg(target_os = "ios")]
+        let (budget, may_start) = self
+            .maintenance_governor
+            .as_mut()
+            .map_or((COMPACT_BUDGET, true), |governor| {
+                let allowance = governor.allowance(self.uploaded_bytes);
+                (allowance.bytes, allowance.start)
+            });
+        #[cfg(not(target_os = "ios"))]
+        let (budget, may_start) = (COMPACT_BUDGET, true);
+        // Finish moving an already closed page before starting another on iOS.
+        #[cfg(target_os = "ios")]
+        let mobile = self.maintenance_governor.is_some();
+        #[cfg(not(target_os = "ios"))]
+        let mobile = false;
+        let section_moving = mobile && self.arena.closing().is_some();
+        let shrinking = mobile
+            && (section_moving
+                || self.sorted_indices.closing().is_some()
+                || self.translucent_arena.as_ref().is_some_and(|a| a.closing().is_some()));
+        let left = if shrinking {
+            budget
+        } else {
+            self.compact_arena(budget, may_start)
+        };
         if let Some(arena) = &mut self.translucent_arena {
             self.graveyard.add(arena.trim());
         }
         self.graveyard.add(self.sorted_indices.trim());
         arena::free_later(self.graveyard.advance());
-        self.shrink_translucent(left);
+        if !mobile || !section_moving {
+            if left > 0 || !mobile {
+                self.shrink_translucent(left, budget, may_start);
+            }
+        }
         if let Some(flat) = &mut self.flat {
             let translucent = self.translucent_arena.as_ref();
             flat.trim(|key| match key.checked_sub(flat::TRANSLUCENT_KEYS) {
@@ -7327,7 +7362,6 @@ impl Renderer {
         if self.suspended {
             return Ok(false);
         }
-        let started = Instant::now();
         if self.first_frame == FirstFrame::Acquire {
             // Once: a minimized window acquires nothing for a while.
             startup_step(format_args!("acquiring the first frame"));
@@ -9501,10 +9535,12 @@ impl Renderer {
                         wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::TEXTURE_BINDING,
                     ),
+                    // This depth is cleared and discarded in the mirror pass; only color is sampled.
                     depth: target(
                         "Water mirror depth",
                         wgpu::TextureFormat::Depth32Float,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TRANSIENT_ATTACHMENT,
                     ),
                 });
             }
@@ -11174,7 +11210,7 @@ impl Renderer {
                     self.deferred = Some(offscreen);
                     // The frame's waits for the previous one on the submit thread.
                     self.last_wait += self.queue.take_waited();
-                    self.last_encode = started.elapsed().saturating_sub(self.last_wait);
+                    self.record_render_work(started);
                     self.visible = visible;
                     self.visible_lods = visible_lods;
                     self.shadow_visible = shadow_visible;
@@ -11279,12 +11315,21 @@ impl Renderer {
         self.last_wait += present.elapsed();
         // Inside the present's time already.
         self.queue.take_waited();
-        self.last_encode = started.elapsed().saturating_sub(self.last_wait);
+        self.record_render_work(started);
         let _ = self.started;
         self.visible = visible;
         self.visible_lods = visible_lods;
         self.shadow_visible = shadow_visible;
         Ok(true)
+    }
+
+    fn record_render_work(&mut self, started: Instant) {
+        let wall_frame = started.elapsed();
+        self.last_encode = wall_frame.saturating_sub(self.last_wait);
+        #[cfg(target_os = "ios")]
+        if let Some(governor) = &mut self.maintenance_governor {
+            governor.observe(self.last_encode);
+        }
     }
 }
 impl Renderer {
@@ -12150,15 +12195,15 @@ mod tests {
         use std::time::{Duration, Instant};
         let (now, ms) = (Instant::now(), Duration::from_millis(1));
         let mut gate = ShrinkGate::default();
-        assert!(gate.may_start(now, COMPACT_BUDGET));
-        assert!(!gate.may_start(now, COMPACT_BUDGET - 1));
+        assert!(gate.may_start(now, COMPACT_BUDGET, COMPACT_BUDGET));
+        assert!(!gate.may_start(now, COMPACT_BUDGET - 1, COMPACT_BUDGET));
         gate.wait(now, SHRINK_SETTLE);
-        assert!(!gate.may_start(now + SHRINK_SETTLE - ms, COMPACT_BUDGET));
-        assert!(gate.may_start(now + SHRINK_SETTLE, COMPACT_BUDGET));
+        assert!(!gate.may_start(now + SHRINK_SETTLE - ms, COMPACT_BUDGET, COMPACT_BUDGET));
+        assert!(gate.may_start(now + SHRINK_SETTLE, COMPACT_BUDGET, COMPACT_BUDGET));
         gate.wait(now, SHRINK_RETRY);
         gate.wait(now + ms, SHRINK_SETTLE);
-        assert!(!gate.may_start(now + SHRINK_RETRY - ms, COMPACT_BUDGET));
-        assert!(gate.may_start(now + SHRINK_RETRY, COMPACT_BUDGET));
+        assert!(!gate.may_start(now + SHRINK_RETRY - ms, COMPACT_BUDGET, COMPACT_BUDGET));
+        assert!(gate.may_start(now + SHRINK_RETRY, COMPACT_BUDGET, COMPACT_BUDGET));
     }
 
     #[test]
