@@ -2,6 +2,7 @@
 //! through a launcher): a window that says where to get them
 //! (`horizon_client::no_resources`) and quits when it is closed. No loader, no
 //! crash report: nothing went wrong in the game.
+use super::loading_screen::{BigStack, follow_window_size, window_size};
 use super::*;
 use horizon_client::no_resources::{Action, NoResources};
 use winit::event::MouseButton;
@@ -13,6 +14,8 @@ struct Missing {
     screen: NoResources,
     /// The pointer in physical pixels.
     pointer: (f64, f64),
+    #[cfg(target_os = "ios")]
+    touch_mouse: horizon_client_input::touch::TouchMouse,
     api: horizon_client::graphics::GraphicsApi,
     settings: Settings,
     error: Option<Box<dyn std::error::Error>>,
@@ -37,12 +40,14 @@ pub(super) fn show(looked_in: &std::path::Path, settings: &Settings) -> Result<(
         },
         screen: NoResources::new(looked_in, horizon_hooks::engine::get_the_game()),
         pointer: (0.0, 0.0),
+        #[cfg(target_os = "ios")]
+        touch_mouse: Default::default(),
         api: settings.horizon.api,
         settings: settings.clone(),
         error: None,
     };
 
-    EventLoop::new()?.run_app(&mut app)?;
+    EventLoop::new()?.run_app(&mut BigStack(&mut app))?;
     app.error.map_or(Ok(()), Err)
 }
 
@@ -104,14 +109,13 @@ impl ApplicationHandler for Missing {
             return;
         }
         let attributes =
-            horizon_client::window::with_icon(Window::default_attributes().with_title("Horizon"))
-                .with_inner_size(winit::dpi::LogicalSize::new(1040.0, 700.0));
+            horizon_client::window::with_icon(Window::default_attributes().with_title("Horizon"));
         let made = event_loop
-            .create_window(attributes)
+            .create_window(window_size(attributes, [1040.0, 700.0]))
             .map_err(Into::into)
             .and_then(|window| {
                 let window = Arc::new(window);
-                let renderer = loading_renderer(
+                let mut renderer = loading_renderer(
                     window.clone(),
                     false,
                     Some(&self.gui.atlas),
@@ -120,6 +124,7 @@ impl ApplicationHandler for Missing {
                     self.api,
                     false,
                 )?;
+                follow_window_size(Some(&window), Some(&mut renderer));
                 Ok((window, renderer))
             });
         match made {
@@ -136,6 +141,15 @@ impl ApplicationHandler for Missing {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        follow_window_size(self.window.as_deref(), self.renderer.as_mut());
+        #[cfg(target_os = "ios")]
+        if let WindowEvent::Touch(_) = event {
+            let events = self.touch_mouse.translate(event);
+            for event in events {
+                self.window_event(event_loop, id, event);
+            }
+            return;
+        }
         let Some(window) = self.window.clone().filter(|w| w.id() == id) else {
             return;
         };
@@ -143,7 +157,9 @@ impl ApplicationHandler for Missing {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
-                    r.resize(size.width, size.height);
+                    if !cfg!(target_os = "ios") {
+                        r.resize(size.width, size.height);
+                    }
                 }
                 window.request_redraw();
             }
