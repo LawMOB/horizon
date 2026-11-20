@@ -122,6 +122,7 @@ use resource_loader::{
     EntityModels, GameCpuResources, Loaded, LoaderMsg, PendingWorldEntry, WorldRestLoader,
     run_loading, write_report,
 };
+use window_handler::ClientQuit;
 // `Action` here is the title screen's buttons (`title::Action`).
 use self::api_values::TryIntoApi;
 pub(crate) use api_values::{block_jump_factor, block_speed_factor, is_ladder};
@@ -1362,6 +1363,9 @@ struct Game<'a> {
     /// Duration of the last frame in ticks (GUI easing).
     frame_ticks: f32,
     title: Option<Title>,
+    /// The save a native mod asked the title to open (`request_world`), taken by the title's next frame, which
+    /// asks the player first.
+    native_world_request: Option<native_world_request::Request>,
     /// Armor slots: head, chest, legs, feet.
     armor: [Option<ItemStack>; 4],
     /// The off hand (Inventory slot 40, saved as slot 150; menu slot 504 here).
@@ -1843,6 +1847,8 @@ struct Game<'a> {
     text_selection: horizon_client::clipboard::AppendSelection,
     /// The world was saved for the application ending (`save_for_exit`).
     saved_for_exit: bool,
+    /// A mod's read-only screen hook can queue the primary client's quit.
+    client_quit: std::cell::Cell<ClientQuit>,
     pending_save: Option<saving::ClosingSave>,
     /// Scheduled end of the server tick (`MinecraftServer.haveTime`).
     server_tick_deadline: Option<Instant>,
@@ -9029,6 +9035,7 @@ impl Game<'_> {
                         return;
                     }
                     self.pending_save.as_mut().unwrap().quit = true;
+                    self.client_quit.set(ClientQuit::ShuttingDown);
                 }
                 WindowEvent::Focused(focused) => {
                     self.focused = focused;
@@ -10118,6 +10125,9 @@ impl Game<'_> {
                     self.report_activity();
                     let target = self.tick_target_millis();
                     let steps = self.clock.advance(elapsed, target);
+                    // Once per frame, whatever `steps` is: `tick` never runs on the title, and a frame with
+                    // no client tick would leave a queued `request_world` waiting. The title draws after this.
+                    self.drain_native_world_request()?;
                     self.client_tick_steps(steps, Some(event_loop))?;
                     self.extras_frame(elapsed);
                     self.extras_retry()?;
@@ -10299,6 +10309,7 @@ impl Game<'_> {
                                 .world_frames
                                 .is_some_and(|f| self.world_frames >= f)
                         {
+                            self.client_quit.set(ClientQuit::ShuttingDown);
                             event_loop.exit();
                         }
                     }
@@ -10656,6 +10667,7 @@ impl<'a> Game<'a> {
             scope_scale: 0.5,
             frame_ticks: 0.0,
             title: None,
+            native_world_request: None,
             armor: [None, None, None, None],
             offhand: None,
             equipment: Default::default(),
@@ -10924,6 +10936,7 @@ impl<'a> Game<'a> {
             user_input: Default::default(),
             text_selection: Default::default(),
             saved_for_exit: false,
+            client_quit: std::cell::Cell::new(ClientQuit::Running),
             pending_save: None,
             server_tick_deadline: None,
             frame_drawn: true,
@@ -11163,9 +11176,11 @@ pub(crate) fn run_with(
     {
         log::warn!("Mod dimensions already installed; keeping the first table");
     }
-    // Their chunk generators and biome sources, which those levels' and the packs' stems name.
+    // Their chunk generators and biome sources, which those levels' and the packs' stems name,
+    // and density function types, which the packs' density JSON names.
     native_chunk_generator::install();
     native_biome_source::install();
+    native_density_function::install();
     mods::register_components(&vanilla_root)?;
     mods::register_standalone_models(options.execution_role);
     mods::register_layer_definitions(options.execution_role, &vanilla_root);
