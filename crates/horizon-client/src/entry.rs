@@ -24,9 +24,19 @@ impl Startup {
 /// and resource marker metadata only: no logging, account loading, mods or worker threads.
 /// Account IO, cwd changes and command registration remain in Options::read, after leases.
 pub fn prepare() -> Startup {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     horizon_mod_package::holder::enter();
     let result: crate::Result<_> = (|| {
         let mut command = std::process::Command::new(std::env::current_exe()?);
+        // The app launches outside its writable Documents directory.
+        #[cfg(target_os = "ios")]
+        {
+            let app_home = std::env::var_os("HOME").ok_or("missing iOS app home")?;
+            let documents = std::path::Path::new(&app_home).join("Documents");
+            std::fs::create_dir_all(&documents)?;
+            std::env::set_current_dir(&documents)?;
+            command.env("HORIZON_HOME", documents);
+        }
         command.args(std::env::args_os().skip(1));
         let launch = LaunchArguments::for_command(&command)?;
         let options = game::Options::validate(launch.clone())?;
@@ -39,7 +49,10 @@ pub fn prepare() -> Startup {
     let Some(options) = options else {
         std::process::exit(0);
     };
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     let capture = horizon_mod_package::holder::acquire(&launch);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let capture = None;
     Startup {
         launch,
         options,
