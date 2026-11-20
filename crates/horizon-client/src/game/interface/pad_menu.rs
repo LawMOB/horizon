@@ -2075,6 +2075,10 @@ impl Game<'_> {
     /// Steam's on a Steam Deck (`steam://open/keyboard`, which types into
     /// the window like a real keyboard).
     fn pad_open_keyboard(&mut self) {
+        // On iOS the iPhone's own keyboard comes up for the focused field (ime.rs).
+        if cfg!(target_os = "ios") {
+            return;
+        }
         // Without xdg-open (macOS, Windows), Horizon's keyboard instead.
         if gamepad::steam_keyboard(self.settings.controller.keyboard)
             && std::process::Command::new("xdg-open")
@@ -2089,6 +2093,27 @@ impl Game<'_> {
         }
         let suggests = self.screen == Screen::Chat && self.title.is_none() && !self.dialog_open();
         self.pad.menu.osk = Some(Keyboard::new(self.pad_enter_keeps_typing(), suggests));
+    }
+
+    /// A tap outside the field dismisses the iOS keyboard. Tapping the caret row reopens it.
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    pub(super) fn touch_tapped(&mut self) {
+        let on_field = field_at(&self.pad_targets(), self.cursor);
+        let on_row = self
+            .soft_keyboard
+            .row
+            .zip(self.gui_batch())
+            .is_some_and(|(row, batch)| {
+                let y = self.cursor.1 * batch.scale;
+                let slack = 8.0 * batch.scale;
+                y >= row[1] as f32 - slack && y <= (row[1] + row[3]) as f32 + slack
+            });
+        if on_field || on_row {
+            self.soft_keyboard.away = false;
+        } else if horizon_client::screen_keyboard::height_points() > 0.0 {
+            self.soft_keyboard.away = true;
+            self.soft_keyboard.row = self.ime_area.or(self.soft_keyboard.row);
+        }
     }
 
     /// Chat or a sign opened by the pad (either menu mode): the keyboard
