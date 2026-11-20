@@ -50,6 +50,7 @@ pub(super) struct StartupMenu {
     /// the screen it leaves (`Screen.clearFocus`).
     focus_screen: u64,
     pub pending: Option<PendingWorldEntry>,
+    edit_touch: bool,
     pub reload_packs: bool,
     /// Browse mods' worker (`mod_browser`).
     mod_jobs: super::mod_browser::Jobs,
@@ -181,6 +182,9 @@ impl StartupMenu {
             game.set_screen(Screen::Options);
             game.options_from_title = true;
             game.dragging = self.dragging;
+        }
+        if std::mem::take(&mut self.edit_touch) {
+            game.open_touch_editor();
         }
         if let Some(focus) = self.key_focus.take() {
             game.key_focus_adopt(focus, self.key_slider_edit);
@@ -461,6 +465,10 @@ impl Loading {
                 match self.receiver.try_recv() {
                     Ok(LoaderMsg::Ui(gui, root)) => self.set_ui(gui, root),
                     Ok(LoaderMsg::Done(result)) => {
+                        #[cfg(target_os = "ios")]
+                        if let Err(error) = &result {
+                            self.show_startup_resource_error(error);
+                        }
                         self.loaded = Some(result);
                         self.delivered = true;
                         break;
@@ -480,9 +488,33 @@ impl Loading {
                 }
             }
         }
+        #[cfg(target_os = "ios")]
+        {
+            let world_result = match &mut self.loaded {
+                Some(Ok(loaded)) => WorldRestLoader::poll(&mut loaded.rest_loader),
+                _ => Ok(true),
+            };
+            if let Err(error) = world_result {
+                self.show_startup_resource_error(&error.to_string());
+            }
+        }
         self.drive_menu_mod_browser();
         self.restart_menu_resources()
     }
+
+    // iOS cannot terminate its event loop to report a startup failure. Keep the
+    // menu drawing and use its existing resource-error dialog instead.
+    #[cfg(any(target_os = "ios", test))]
+    pub(super) fn show_startup_resource_error(&mut self, message: &str) {
+        log::error!("Horizon: startup resource load failed: {message}");
+        self.loaded = Some(Err(message.to_owned()));
+        self.delivered = true;
+        self.menu.reload_packs = false;
+        self.menu.pending = None;
+        self.open_menu_options(Page::Packs);
+        self.menu.options.resource_error = Some(message.to_owned());
+    }
+
     /// The startup menu's Browse mods, as `Game::drive_mod_browser`.
     fn drive_menu_mod_browser(&mut self) {
         let menu = &mut self.menu;
@@ -663,6 +695,7 @@ impl Loading {
                     let _ = std::fs::create_dir_all(&dir);
                     packs::open_folder(&dir);
                 }
+                Event::EditTouchControls => self.menu.edit_touch = true,
                 Event::OpenModFolder => {
                     let dir = Game::game_dir().join(horizon_client::mod_list::DIR);
                     let _ = std::fs::create_dir_all(&dir);
@@ -1096,6 +1129,22 @@ impl Loading {
         self.menu.key_synthetic = was;
     }
 
+    #[cfg(target_os = "ios")]
+    pub(super) fn sync_menu_ime(&mut self) {
+        let want = if self.menu.options_open {
+            self.menu.options.typing()
+        } else {
+            self.menu.title.as_mut().is_some_and(|title| {
+                title.has_caret_field() || title.focused_field().is_some()
+            })
+        };
+        if want != self.ime_allowed && let Some(window) = &self.window {
+            horizon_client::screen_keyboard::watch();
+            self.ime_allowed = want;
+            window.set_ime_allowed(want);
+        }
+    }
+
     pub(super) fn menu_event(
         &mut self,
         event_loop: &dyn EventLoopCtl,
@@ -1151,7 +1200,9 @@ impl Loading {
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
-                    r.resize(size.width, size.height);
+                    if !cfg!(target_os = "ios") {
+                        r.resize(size.width, size.height);
+                    }
                 }
                 self.apply_menu_settings();
             }
@@ -1340,6 +1391,12 @@ impl Loading {
                             event.text.as_deref(),
                         );
                         self.menu_option_events(events);
+                    } else if cfg!(target_os = "ios")
+                        && !handled
+                        && matches!(event.physical_key, PhysicalKey::Unidentified(_))
+                        && let Some(text) = event.text.as_deref()
+                    {
+                        self.menu.options.type_text(atlas, text);
                     }
                 } else {
                     let batch = HudBatch::new(self.menu_size(), self.settings.gui_scale_inputs());
@@ -1571,6 +1628,8 @@ mod tests {
             shown: false,
             ui_at: None,
             title_drawn: false,
+            #[cfg(target_os = "ios")]
+            ime_allowed: false,
             menu: StartupMenu::default(),
             error: None,
         }
@@ -1880,6 +1939,31 @@ mod tests {
             if address == "localhost:25565" && name == "Guest")
         );
         assert!(menu.pending.take().is_none(), "an entry is consumed once");
+    }
+
+    #[test]
+    fn a_startup_resource_failure_cancels_entry_and_draws_its_error() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut loading = loading(receiver);
+        let root = std::env::temp_dir().join("horizon-startup-resource-error");
+        loading.gui = Some(gui(&root));
+        loading.menu.pending = Some(PendingWorldEntry::StudioReplay(root));
+        loading.show_startup_resource_error("missing entity-models.json");
+        assert!(loading.menu.pending.is_none());
+        assert!(loading.menu.options_open);
+        assert_eq!(
+            loading.menu.options.resource_error.as_deref(),
+            Some("missing entity-models.json")
+        );
+        assert!(loading.error.is_none());
+        assert!(
+            matches!(&loading.loaded, Some(Err(error)) if error == "missing entity-models.json")
+        );
+        #[cfg(target_os = "ios")]
+        assert!(!loading.ready_for_handoff());
+        let mut batch = HudBatch::scratch([1280, 720]);
+        loading.draw_menu(&mut batch);
+        assert!(!batch.vertices.is_empty());
     }
 
     #[test]
