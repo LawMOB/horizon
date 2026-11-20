@@ -20,7 +20,7 @@ pub mod junction;
 pub mod layouts;
 #[cfg(all(
     feature = "runtime-process",
-    any(target_os = "linux", target_os = "macos", windows)
+    any(target_os = "linux", target_os = "macos", target_os = "ios", windows)
 ))]
 pub mod local_control;
 #[cfg(feature = "runtime-process")]
