@@ -1179,6 +1179,8 @@ struct Game<'a> {
     last_device_recovery: Option<Instant>,
     /// CPU geometry storage retained across frames, including empty/title frames.
     entity_vertices: Vec<Vertex>,
+    /// Reused entity shadow caster list; grows to the busiest observed frame.
+    shadow_casters_scratch: Vec<(glam::DVec3, f32, f32)>,
     /// Horizon Extras' dynamic lights this frame (`dynamic_lights.rs`), and how brightly each
     /// item glows (built the first time the extra is on).
     dynamic_lights: Vec<[f32; 4]>,
@@ -5489,8 +5491,9 @@ impl Game<'_> {
                     p.z + (q.z - p.z) * a,
                 )
             };
-            let mut casters: Vec<(glam::DVec3, f32, f32)> =
-                horizon_client::shadows::mob_casters(self.drawn_mobs(), a).collect();
+            let mut casters = std::mem::take(&mut self.shadow_casters_scratch);
+            casters.clear();
+            casters.extend(horizon_client::shadows::mob_casters(self.drawn_mobs(), a));
             let item = horizon_client::shadows::shadow_params("minecraft:item");
             casters.extend(
                 self.dropped
@@ -5510,7 +5513,7 @@ impl Game<'_> {
                 .view_frustum
                 .as_ref()
                 .filter(|_| self.pack_ids.is_none() && self.native_shaders.picked.is_empty());
-            for (pos, radius, strength) in casters {
+            for &(pos, radius, strength) in &casters {
                 if let Some(view) = shadow_view
                     && !horizon_client::shadows::in_view(view, camera, pos, radius, strength)
                 {
@@ -5539,6 +5542,7 @@ impl Game<'_> {
                 );
             }
         }
+        self.shadow_casters_scratch = casters;
         laps.lap("eg_shadows");
         // Block entities (BlockEntityRenderers): chests, shulker boxes, banners, skulls...
         if let Some(r) = &self.renderer {
@@ -10594,6 +10598,7 @@ impl<'a> Game<'a> {
             renderer: None,
             last_device_recovery: None,
             entity_vertices: Vec::new(),
+            shadow_casters_scratch: Vec::new(),
             dynamic_lights: Vec::new(),
             luminance: Default::default(),
             see_through_vertices: Vec::new(),
