@@ -16,7 +16,7 @@ use horizon_client::actions::Action as Mapping;
 use horizon_client::gamepad::{Button, PadState};
 use horizon_client_input::touch::{
     Area, Bind, Control, EditorButton, EditorMenu, Layout, Picker, PickerHit, TouchButton,
-    TouchSettings, icons,
+    TouchSettings,
 };
 use horizon_client_render::touch::style;
 use winit::event::{Touch, TouchPhase};
@@ -26,8 +26,6 @@ use winit::event::{Touch, TouchPhase};
 const LOOK_SPEED: f64 = 2.0;
 
 /// Colours, as the HUD's `0xAARRGGBB`, at full opacity.
-const FACE: u32 = 0xff80_8080;
-const FACE_PRESSED: u32 = 0xff70_7070;
 const EDGE: u32 = 0xffd0_d0d0;
 const INK: u32 = 0xffff_ffff;
 const BUTTON_INK: u32 = 0xff00_0000;
@@ -713,7 +711,7 @@ fn faded(colour: u32, k: f32) -> u32 {
     (alpha << 24) | (colour & 0x00ff_ffff)
 }
 
-/// A button: its face, edge and icon, at opacity `k`.
+/// A button's PNG, including its held state, at opacity `k`.
 fn draw_button(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -722,12 +720,7 @@ fn draw_button(
     k: f32,
     pressed: bool,
 ) {
-    if draw_touch_sprite(batch, atlas, style::button_sprite(button, pressed), a, k) {
-        return;
-    }
-    draw_plate(batch, atlas, a, k, pressed);
-    let ink = if pressed { INK_PRESSED } else { BUTTON_INK };
-    draw_icon(batch, atlas, icons::icon(button), a, faded(ink, k));
+    draw_touch_sprite(batch, atlas, style::button_sprite(button, pressed), a, k);
 }
 
 fn binding_label(binding: &str) -> String {
@@ -737,27 +730,19 @@ fn binding_label(binding: &str) -> String {
         .join("+")
 }
 
-/// The baked touch artwork, tinted only by the saved control opacity.
+/// The touch PNG, tinted only by the saved control opacity.
 fn draw_touch_sprite(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
     sprite: &str,
     a: Area,
     opacity: f32,
-) -> bool {
-    if !atlas.sprites.contains_key(sprite) {
-        return false;
-    }
+) {
     batch.sprite_scaled(atlas, sprite, a.x, a.y, a.w, a.h, faded(INK, opacity));
-    true
 }
 
 fn draw_plate(batch: &mut HudBatch, atlas: &HudAtlas, a: Area, k: f32, pressed: bool) {
-    if draw_touch_sprite(batch, atlas, style::plate_sprite(pressed), a, k) {
-        return;
-    }
-    let face = if pressed { FACE_PRESSED } else { FACE };
-    bevel(batch, atlas, a, faded(face, k), pressed);
+    draw_touch_sprite(batch, atlas, style::plate_sprite(pressed), a, k);
 }
 
 fn bevel(batch: &mut HudBatch, atlas: &HudAtlas, a: Area, face: u32, pressed: bool) {
@@ -793,30 +778,8 @@ fn draw_stick(
         w: radius,
         h: radius,
     };
-    if !draw_touch_sprite(batch, atlas, style::STICK, base, k) {
-        disc(batch, atlas, origin, radius, faded(FACE, k));
-        ring(batch, atlas, origin, radius, faded(EDGE, k));
-    }
-    if !draw_touch_sprite(batch, atlas, style::STICK_KNOB, top, k) {
-        disc(batch, atlas, knob, radius * 0.5, faded(FACE_PRESSED, k));
-    }
-}
-
-/// `icon` centred in `a`, in `ink`.
-fn draw_icon(batch: &mut HudBatch, atlas: &HudAtlas, icon: &icons::Icon, a: Area, ink: u32) {
-    let px = (a.w.min(a.h) * 0.62 / icons::SIZE as f32).max(0.5);
-    let side = px * icons::SIZE as f32;
-    let (x0, y0) = (a.x + (a.w - side) / 2.0, a.y + (a.h - side) / 2.0);
-    for (row, col, len) in icons::runs(icon) {
-        batch.fill(
-            atlas,
-            x0 + col as f32 * px,
-            y0 + row as f32 * px,
-            len as f32 * px,
-            px,
-            ink,
-        );
-    }
+    draw_touch_sprite(batch, atlas, style::STICK, base, k);
+    draw_touch_sprite(batch, atlas, style::STICK_KNOB, top, k);
 }
 
 /// A one-unit frame round `a`.
@@ -825,35 +788,6 @@ fn outline(batch: &mut HudBatch, atlas: &HudAtlas, a: Area, c: u32) {
     batch.fill(atlas, a.x, a.y + a.h - 1.0, a.w, 1.0, c);
     batch.fill(atlas, a.x, a.y + 1.0, 1.0, a.h - 2.0, c);
     batch.fill(atlas, a.x + a.w - 1.0, a.y + 1.0, 1.0, a.h - 2.0, c);
-}
-
-/// A filled circle, as one span per unit-high row.
-fn disc(batch: &mut HudBatch, atlas: &HudAtlas, (cx, cy): (f32, f32), r: f32, c: u32) {
-    let rows = r.ceil() as i32;
-    for i in -rows..rows {
-        let y = i as f32 + 0.5;
-        let half = (r * r - y * y).max(0.0).sqrt();
-        if half > 0.0 {
-            batch.fill(atlas, cx - half, cy + i as f32, half * 2.0, 1.0, c);
-        }
-    }
-}
-
-/// A circle's one-unit edge.
-fn ring(batch: &mut HudBatch, atlas: &HudAtlas, (cx, cy): (f32, f32), r: f32, c: u32) {
-    let rows = r.ceil() as i32;
-    let inner = (r - 1.0).max(0.0);
-    for i in -rows..rows {
-        let y = i as f32 + 0.5;
-        let outer = (r * r - y * y).max(0.0).sqrt();
-        let within = (inner * inner - y * y).max(0.0).sqrt();
-        if outer <= 0.0 {
-            continue;
-        }
-        let w = (outer - within).max(1.0);
-        batch.fill(atlas, cx - outer, cy + i as f32, w, 1.0, c);
-        batch.fill(atlas, cx + outer - w, cy + i as f32, w, 1.0, c);
-    }
 }
 
 /// `text` cut to `width`, keeping whole characters.
