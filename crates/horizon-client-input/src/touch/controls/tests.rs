@@ -311,6 +311,7 @@ fn toolbar(l: &Layout, button: EditorButton) -> (f32, f32) {
 #[test]
 fn the_editor_moves_a_button_where_it_is_dragged_and_done_keeps_it() {
     let mut t = TouchControls::default();
+    t.snapping.enabled = false; // Exercise free dragging independently of snapping.
     let now = Instant::now();
     let l = t.layout(W, H, safe());
     open_editor(&mut t, &l, now);
@@ -523,22 +524,31 @@ fn the_settings_file_skips_what_it_cant_read_and_keeps_values_in_range() {
 
 #[test]
 fn the_editors_toolbar_covers_no_control_where_they_start() {
-    let l = layout();
-    for (button, t) in EditorButton::toolbar(&l) {
-        assert!(
-            t.x >= l.safe.x && t.x + t.w <= l.safe.x + l.safe.w,
-            "{button:?} off the safe area"
+    for width in [W, 427.0, 240.0] {
+        let margin = if width == W { 44.0 } else { 0.0 };
+        let l = Layout::new(
+            width,
+            H,
+            Area { x: margin, y: 0.0, w: width - margin * 2.0, h: H - 5.0 },
+            &TouchSettings::default(),
         );
-        for item in &l.items {
-            let a = item.area;
-            let apart =
-                t.x + t.w <= a.x || a.x + a.w <= t.x || t.y + t.h <= a.y || a.y + a.h <= t.y;
-            // The stick's square may lie under the toolbar when the stick is moved there.
+        for (button, t) in EditorButton::toolbar(&l) {
             assert!(
-                apart || item.control == Control::Stick,
-                "{button:?} covers {:?}",
-                item.control
+                t.x >= l.safe.x && t.x + t.w <= l.safe.x + l.safe.w
+                    && t.y >= l.safe.y && t.y + t.h <= l.safe.y + l.safe.h,
+                "{button:?} off the safe area on width {width}"
             );
+            for item in &l.items {
+                let a = item.area;
+                let apart = t.x + t.w <= a.x || a.x + a.w <= t.x
+                    || t.y + t.h <= a.y || a.y + a.h <= t.y;
+                // The stick's square may lie under the toolbar when it is moved there.
+                assert!(
+                    apart || item.control == Control::Stick,
+                    "{button:?} covers {:?}",
+                    item.control
+                );
+            }
         }
     }
 }
@@ -891,4 +901,86 @@ fn no_more_than_the_most_can_be_added() {
         assert!(s.add_custom(Bind::Unbound, Placement::default()).is_some());
     }
     assert!(s.add_custom(Bind::Unbound, Placement::default()).is_none());
+}
+
+#[test]
+fn editor_snapping_detaches_from_raw_motion_and_guides_end_with_the_gesture() {
+    let mut t = TouchControls::default();
+    let now = Instant::now();
+    for control in Control::all() {
+        t.settings.set(control, Placement { hidden: true, ..Placement::default() });
+    }
+    // The hotbar remains visible in real profiles; park it away from this drag.
+    t.settings.set(Control::Hotbar, Placement {
+        centre: Some(((150.0 - safe().x) / safe().w, 265.0 / safe().h)),
+        ..Placement::default()
+    });
+    // Use is picked after Jump when their snapped rectangles overlap.
+    let moving = Control::Button(TouchButton::Use);
+    t.settings.set(moving, Placement {
+        centre: Some(((200.0 - safe().x) / safe().w, 120.0 / safe().h)),
+        ..Placement::default()
+    });
+    t.settings.set(Control::Button(TouchButton::Jump), Placement {
+        centre: Some(((400.0 - safe().x) / safe().w, 200.0 / safe().h)),
+        size: 2.0,
+        ..Placement::default()
+    });
+    t.open_editor();
+    assert!(t.editor().unwrap().snap_enabled);
+    let l = t.layout(W, H, safe());
+    // A grab three units off centre must stay offset while snapping.
+    t.touch(&l, 1, Started, (203.0, 120.0), now);
+    t.touch(&l, 1, Moved, (388.0, 186.0), now);
+    let guides = t.editor().unwrap().guides;
+    assert!(guides.vertical.is_some() && guides.horizontal.is_some());
+    let l = t.layout(W, H, safe());
+    let area = l.item(moving).area;
+    assert!((area.x - 370.0).abs() < 0.001 && (area.y - 170.0).abs() < 0.001);
+    // Several small moves beyond the threshold detach X without losing Y.
+    for x in 389..=395 {
+        let l = t.layout(W, H, safe());
+        t.touch(&l, 1, Moved, (x as f32, 187.0), now);
+    }
+    let l = t.layout(W, H, safe());
+    assert!((l.item(moving).area.x - 377.0).abs() < 0.001);
+    assert!(t.editor().unwrap().guides.vertical.is_none());
+    assert!(t.editor().unwrap().guides.horizontal.is_some());
+    // An unrelated finger lifting must not end the active drag's guides.
+    t.touch(&l, 9, Ended, (0.0, 0.0), now);
+    assert!(t.editor().unwrap().guides.horizontal.is_some());
+    t.touch(&l, 1, Ended, (395.0, 187.0), now);
+    assert_eq!(t.editor().unwrap().guides, SnapGuides::default());
+    for phase in [Cancelled, Ended] {
+        let l = t.layout(W, H, safe());
+        let start = l.item(moving).area.centre();
+        t.touch(&l, 2, Started, start, now);
+        t.touch(&l, 2, Moved, (start.0 - 8.0, start.1), now);
+        assert!(t.editor().unwrap().guides.horizontal.is_some());
+        if phase == Cancelled {
+            t.touch(&l, 2, phase, start, now);
+        } else {
+            t.release_all();
+        }
+        assert_eq!(t.editor().unwrap().guides, SnapGuides::default());
+    }
+    // Snap is an editor preference: toggling it changes no saved placement fields.
+    let draft = t.editor.as_ref().unwrap().draft.clone();
+    let l = t.layout(W, H, safe());
+    t.touch(&l, 3, Started, toolbar(&l, EditorButton::Snap), now);
+    assert!(!t.editor().unwrap().snap_enabled);
+    assert_eq!(t.editor.as_ref().unwrap().draft, draft);
+    t.touch(&l, 3, Ended, toolbar(&l, EditorButton::Snap), now);
+    let start = l.item(moving).area.centre();
+    t.touch(&l, 4, Started, start, now);
+    t.touch(&l, 4, Moved, (388.0, 186.0), now);
+    assert_eq!(t.editor().unwrap().guides, SnapGuides::default());
+    let l = t.layout(W, H, safe());
+    assert!((l.item(moving).area.centre().0 - 388.0).abs() < 0.001);
+    t.touch(&l, 4, Ended, (388.0, 186.0), now);
+    t.touch(&l, 5, Started, toolbar(&l, EditorButton::Done), now);
+    let saved = t.take_saved().unwrap();
+    let text = saved.to_text();
+    assert_eq!(TouchSettings::parse(&text).to_text(), text);
+    assert!(!t.snapping.enabled);
 }
