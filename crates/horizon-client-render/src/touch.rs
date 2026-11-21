@@ -13,6 +13,7 @@
 pub mod aim;
 mod draw;
 pub mod layout;
+pub mod style;
 pub use aim::{
     attack_indicator, camera_delta, hotbar_slot, item_places_entity_on_tap, item_uses_on_tap,
     projectile_crosshair, screen_direction,
