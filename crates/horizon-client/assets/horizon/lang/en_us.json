@@ -1348,6 +1348,8 @@
   "horizon.touch.edit.hide": "Hide",
   "horizon.touch.edit.show": "Show",
   "horizon.touch.edit.reset": "Reset",
+  "horizon.touch.edit.snap_on": "Snap: ON",
+  "horizon.touch.edit.snap_off": "Snap: OFF",
   "horizon.touch.edit.done": "Done",
   "horizon.touch.edit.caption": "{name}: size {size}%, opacity {opacity}%",
   "horizon.touch.edit.hidden": "{name}: hidden",
