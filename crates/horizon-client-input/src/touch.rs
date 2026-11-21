@@ -1,9 +1,8 @@
 //! Touch screens. Over menus, [`TouchMouse`] makes the first finger the mouse.
 //! While playing, [`TouchControls`] are the on-screen controls, whose layout
-//! the player edits (controls.rs), with their icons (icons.rs). iOS sends
-//! only touches.
+//! the player edits (controls.rs). Artwork belongs to the renderer. iOS
+//! sends only touches.
 mod controls;
-pub mod icons;
 
 pub use controls::*;
 use winit::event::{ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
