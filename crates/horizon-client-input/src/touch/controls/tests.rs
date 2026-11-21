@@ -427,12 +427,12 @@ fn with_nothing_selected_reset_puts_everything_back() {
 }
 
 #[test]
-fn the_hotbar_cant_be_hidden() {
+fn the_hotbar_and_inventory_close_button_cant_be_hidden() {
     let mut t = TouchControls::default();
     let now = Instant::now();
     let l = t.layout(W, H, safe());
     open_editor(&mut t, &l, now);
-    for control in [Control::Hotbar] {
+    for control in [Control::Hotbar, Control::Close] {
         let l = t.layout(W, H, safe());
         t.touch(&l, 1, Started, l.item(control).area.centre(), now);
         t.touch(&l, 1, Ended, l.item(control).area.centre(), now);
@@ -908,7 +908,10 @@ fn editor_snapping_detaches_from_raw_motion_and_guides_end_with_the_gesture() {
     let mut t = TouchControls::default();
     let now = Instant::now();
     for control in Control::all() {
-        t.settings.set(control, Placement { hidden: true, ..Placement::default() });
+        t.settings.set(control, Placement {
+            hidden: control.hideable(),
+            ..Placement::default()
+        });
     }
     // The hotbar remains visible in real profiles; park it away from this drag.
     t.settings.set(Control::Hotbar, Placement {
@@ -983,4 +986,56 @@ fn editor_snapping_detaches_from_raw_motion_and_guides_end_with_the_gesture() {
     let text = saved.to_text();
     assert_eq!(TouchSettings::parse(&text).to_text(), text);
     assert!(!t.snapping.enabled);
+}
+
+#[test]
+fn inventory_close_can_be_dragged_saved_and_loaded_with_its_hit_area() {
+    let mut t = TouchControls::default();
+    t.snapping.enabled = false;
+    let now = Instant::now();
+    // An old profile without a close entry keeps the original top-left placement.
+    t.settings = TouchSettings::parse("jump=0.9000,0.7500,1.30,0.60,0\n");
+    let close = t.settings.close_button(safe());
+    assert_eq!(close.area, Area {
+        x: safe().x + GAP,
+        y: safe().y + GAP,
+        w: 28.0,
+        h: 20.0,
+    });
+    t.open_editor();
+    let l = t.layout(W, H, safe());
+    let start = l.item(Control::Close).area.centre();
+    t.touch(&l, 1, Started, (start.0 + 3.0, start.1), now);
+    assert_eq!(t.editor().unwrap().selected, Some(Control::Close));
+    // The pointer remains off-centre by the same amount throughout the gesture.
+    t.touch(&l, 1, Moved, (263.0, 140.0), now);
+    t.touch(&l, 1, Ended, (263.0, 140.0), now);
+    let l = t.layout(W, H, safe());
+    let item = *l.item(Control::Close);
+    assert!((item.area.centre().0 - 260.0).abs() < 0.001);
+    assert!((item.area.centre().1 - 140.0).abs() < 0.001);
+    assert_eq!(l.button_at(item.area.centre()), None);
+    // Draft coordinates only become active after Done.
+    assert_eq!(t.settings.close_button(safe()), close);
+    t.touch(&l, 2, Started, toolbar(&l, EditorButton::Done), now);
+    let saved = t.take_saved().unwrap();
+    let text = saved.to_text();
+    assert!(text.lines().any(|line| line.starts_with("close=")));
+    let loaded = TouchSettings::parse(&text);
+    let area = loaded.close_button(safe()).area;
+    assert!((area.centre().0 - 260.0).abs() < 0.05);
+    assert!((area.centre().1 - 140.0).abs() < 0.05);
+    assert_eq!(
+        *Layout::new(W, H, safe(), &loaded).item(Control::Close),
+        loaded.close_button(safe()),
+    );
+    assert_eq!(loaded.to_text(), text);
+    // Moving to a screen edge still keeps the whole X inside the safe area.
+    t.settings.set(Control::Close, Placement {
+        centre: Some((1.0, 0.0)),
+        ..Placement::default()
+    });
+    let area = t.settings.close_button(safe()).area;
+    assert_eq!(area.x + area.w, safe().x + safe().w);
+    assert_eq!(area.y, safe().y);
 }
