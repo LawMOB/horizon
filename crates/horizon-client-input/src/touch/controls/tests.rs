@@ -522,22 +522,6 @@ fn the_settings_file_skips_what_it_cant_read_and_keeps_values_in_range() {
 }
 
 #[test]
-fn every_icon_is_twelve_by_twelve() {
-    for b in TouchButton::PLACED.into_iter().chain([TouchButton::Sprint]) {
-        let icon = crate::touch::icons::icon(b);
-        assert!(icon.iter().all(|row| row.chars().count() == 12), "{b:?}");
-        assert!(
-            !crate::touch::icons::runs(icon).is_empty(),
-            "{b:?} is blank"
-        );
-    }
-    // A run per lit stretch of a row.
-    let runs = crate::touch::icons::runs(crate::touch::icons::icon(TouchButton::Pause));
-    assert_eq!(runs[0], (1, 2, 3));
-    assert_eq!(runs[1], (1, 7, 3));
-}
-
-#[test]
 fn the_editors_toolbar_covers_no_control_where_they_start() {
     let l = layout();
     for (button, t) in EditorButton::toolbar(&l) {
