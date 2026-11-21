@@ -2,7 +2,7 @@
 //! the caller supplies the layout's existing, scaled rectangles.
 use super::{Area, Control, Layout};
 
-const SNAP_GAP: f32 = 6.0;
+const SNAP_GAP: f32 = 4.0;
 
 /// Editor preferences, independent of the saved HUD placement schema.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -239,8 +239,8 @@ mod tests {
             (100.0, 80.0, 0.0),
             (130.0, 110.0, 30.0),
             (115.0, 95.0, 15.0),
-            (166.0, 146.0, 0.0),
-            (64.0, 44.0, 30.0),
+            (164.0, 144.0, 0.0),
+            (66.0, 46.0, 30.0),
         ] {
             let raw = Area {
                 x: left + 1.0,
