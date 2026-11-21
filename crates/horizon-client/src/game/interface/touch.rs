@@ -123,8 +123,8 @@ impl Game<'_> {
         self.pad.touch.open_editor();
     }
 
-    /// The inventory close button, at the safe area's top left. Only survival
-    /// and creative inventory screens show it; the layout editor has its own Done.
+    /// The movable inventory close button. Only survival and creative inventory
+    /// screens show it; the layout editor previews its saved placement.
     fn touch_close_button(&self, batch: &HudBatch) -> Option<Area> {
         if !TOUCH_CONTROLS
             || self.title.is_some()
@@ -134,21 +134,15 @@ impl Game<'_> {
             return None;
         }
         let safe = self.touch_safe(batch.width, batch.height, batch.scale);
-        Some(Area {
-            x: safe.x + 4.0,
-            y: safe.y + 4.0,
-            w: 28.0,
-            h: 20.0,
-        })
+        Some(self.pad.touch.settings.close_button(safe).area)
     }
 
     /// The inventory close button (`touch_close_button`).
     pub(super) fn draw_touch_close(&self, batch: &mut HudBatch) {
         if let Some(a) = self.touch_close_button(batch) {
             let atlas = &self.gui.atlas;
-            bevel(batch, atlas, a, MENU_FACE, false);
-            let label = horizon_client::lang::get("horizon.touch.escape");
-            centred_label(batch, atlas, &label, a, BUTTON_INK);
+            let opacity = self.pad.touch.settings.placement(Control::Close).opacity;
+            draw_inventory_close(batch, atlas, a, opacity);
         }
     }
 
@@ -501,7 +495,7 @@ impl Game<'_> {
                     };
                     draw_stick(batch, atlas, origin, knob, r, k);
                 }
-                Control::Hotbar => {}
+                Control::Hotbar | Control::Close => {}
             }
         }
     }
@@ -528,6 +522,7 @@ impl Game<'_> {
                     draw_stick(batch, atlas, home, home, layout.stick_radius, k);
                 }
                 Control::Hotbar => outline(batch, atlas, a, faded(EDGE, 0.8)),
+                Control::Close => draw_inventory_close(batch, atlas, a, k),
             }
             if item.hidden {
                 outline(batch, atlas, a, HIDDEN_EDGE);
@@ -708,6 +703,13 @@ fn touch_settings_path() -> std::path::PathBuf {
 fn faded(colour: u32, k: f32) -> u32 {
     let alpha = ((colour >> 24) as f32 * k.clamp(0.0, 1.0)).round() as u32;
     (alpha << 24) | (colour & 0x00ff_ffff)
+}
+
+/// Draw the same inventory close button in the editor and over an open inventory.
+fn draw_inventory_close(batch: &mut HudBatch, atlas: &HudAtlas, area: Area, opacity: f32) {
+    bevel(batch, atlas, area, faded(MENU_FACE, opacity), false);
+    let label = horizon_client::lang::get("horizon.touch.escape");
+    centred_label(batch, atlas, &label, area, faded(BUTTON_INK, opacity));
 }
 
 /// Overlay geometry only: guides register no controls and receive no pointer events.
