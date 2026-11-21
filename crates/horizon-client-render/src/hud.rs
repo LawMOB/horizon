@@ -1501,6 +1501,12 @@ impl HudAtlas {
                 images.push(image);
             }
         }
+        // Procedural touch art is also needed by the editor over the title screen.
+        for image in crate::touch::style::images() {
+            if !images.iter().any(|i| i.0 == image.0) {
+                images.push(image);
+            }
+        }
         if full {
             // Official Recipes artwork from Just Enough Items, under MIT.
             for (name, png) in crate::jei_sprites::SPRITES {
