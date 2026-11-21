@@ -18,6 +18,7 @@ use horizon_client_input::touch::{
     Area, Bind, Control, EditorButton, EditorMenu, Layout, Picker, PickerHit, TouchButton,
     TouchSettings, icons,
 };
+use horizon_client_render::touch::style;
 use winit::event::{Touch, TouchPhase};
 
 /// How far the view turns per GUI unit dragged, in mouse-movement units
@@ -721,6 +722,9 @@ fn draw_button(
     k: f32,
     pressed: bool,
 ) {
+    if draw_touch_sprite(batch, atlas, style::button_sprite(button, pressed), a, k) {
+        return;
+    }
     draw_plate(batch, atlas, a, k, pressed);
     let ink = if pressed { INK_PRESSED } else { BUTTON_INK };
     draw_icon(batch, atlas, icons::icon(button), a, faded(ink, k));
@@ -733,7 +737,25 @@ fn binding_label(binding: &str) -> String {
         .join("+")
 }
 
+/// The baked touch artwork, tinted only by the saved control opacity.
+fn draw_touch_sprite(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    sprite: &str,
+    a: Area,
+    opacity: f32,
+) -> bool {
+    if !atlas.sprites.contains_key(sprite) {
+        return false;
+    }
+    batch.sprite_scaled(atlas, sprite, a.x, a.y, a.w, a.h, faded(INK, opacity));
+    true
+}
+
 fn draw_plate(batch: &mut HudBatch, atlas: &HudAtlas, a: Area, k: f32, pressed: bool) {
+    if draw_touch_sprite(batch, atlas, style::plate_sprite(pressed), a, k) {
+        return;
+    }
     let face = if pressed { FACE_PRESSED } else { FACE };
     bevel(batch, atlas, a, faded(face, k), pressed);
 }
@@ -759,9 +781,25 @@ fn draw_stick(
     radius: f32,
     k: f32,
 ) {
-    disc(batch, atlas, origin, radius, faded(FACE, k));
-    ring(batch, atlas, origin, radius, faded(EDGE, k));
-    disc(batch, atlas, knob, radius * 0.5, faded(FACE_PRESSED, k));
+    let base = Area {
+        x: origin.0 - radius,
+        y: origin.1 - radius,
+        w: radius * 2.0,
+        h: radius * 2.0,
+    };
+    let top = Area {
+        x: knob.0 - radius * 0.5,
+        y: knob.1 - radius * 0.5,
+        w: radius,
+        h: radius,
+    };
+    if !draw_touch_sprite(batch, atlas, style::STICK, base, k) {
+        disc(batch, atlas, origin, radius, faded(FACE, k));
+        ring(batch, atlas, origin, radius, faded(EDGE, k));
+    }
+    if !draw_touch_sprite(batch, atlas, style::STICK_KNOB, top, k) {
+        disc(batch, atlas, knob, radius * 0.5, faded(FACE_PRESSED, k));
+    }
 }
 
 /// `icon` centred in `a`, in `ink`.
