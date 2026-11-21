@@ -1332,6 +1332,7 @@
   "horizon.touch.perspective": "View",
   "horizon.touch.stick": "Move stick",
   "horizon.touch.hotbar": "Hotbar",
+  "horizon.touch.close": "Inventory close (X)",
   "horizon.touch.custom": "Custom button",
   "horizon.pages.open.touch_controls": "Custom Controls...",
   "horizon.touch.menu.add": "Add button",
