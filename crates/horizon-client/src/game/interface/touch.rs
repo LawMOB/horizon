@@ -557,13 +557,16 @@ impl Game<'_> {
                 );
             }
         }
+        draw_snap_guides(batch, atlas, view.guides);
         let mut bottom = layout.safe.y;
         for (button, a) in EditorButton::toolbar(layout) {
             let done = button == EditorButton::Done;
-            let face = if done { 0xff3c_7025 } else { MENU_FACE };
+            let active = done || (button == EditorButton::Snap && view.snap_enabled);
+            let face = if active { 0xff3c_7025 } else { MENU_FACE };
             bevel(batch, atlas, a, face, false);
-            let label = horizon_client::lang::get(button.label(view.placement.hidden));
-            centred_label(batch, atlas, &label, a, if done { INK } else { BUTTON_INK });
+            let label =
+                horizon_client::lang::get(button.label(view.placement.hidden, view.snap_enabled));
+            centred_label(batch, atlas, &label, a, if active { INK } else { BUTTON_INK });
             bottom = bottom.max(a.y + a.h);
         }
         let caption = match view.selected {
@@ -709,6 +712,40 @@ fn touch_settings_path() -> std::path::PathBuf {
 fn faded(colour: u32, k: f32) -> u32 {
     let alpha = ((colour >> 24) as f32 * k.clamp(0.0, 1.0)).round() as u32;
     (alpha << 24) | (colour & 0x00ff_ffff)
+}
+
+/// Overlay geometry only: guides register no controls and receive no pointer events.
+fn draw_snap_guides(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    guides: horizon_client_input::touch::SnapGuides,
+) {
+    const CYAN: u32 = 0xff00_e5ff;
+    let scale = batch.scale.max(1.0);
+    let align = |value: f32| (value * scale).round() / scale;
+    let thickness = 1.0;
+    if let Some(line) = guides.vertical {
+        let start = align(line.start);
+        batch.fill(
+            atlas,
+            align(line.at).clamp(0.0, (batch.width - thickness).max(0.0)),
+            start,
+            thickness,
+            (align(line.end) - start).max(thickness),
+            CYAN,
+        );
+    }
+    if let Some(line) = guides.horizontal {
+        let start = align(line.start);
+        batch.fill(
+            atlas,
+            start,
+            align(line.at).clamp(0.0, (batch.height - thickness).max(0.0)),
+            (align(line.end) - start).max(thickness),
+            thickness,
+            CYAN,
+        );
+    }
 }
 
 /// A button's PNG, including its held state, at opacity `k`.
