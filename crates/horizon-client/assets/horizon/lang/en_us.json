@@ -1354,7 +1354,7 @@
   "horizon.touch.edit.caption": "{name}: size {size}%, opacity {opacity}%",
   "horizon.touch.edit.hidden": "{name}: hidden",
   "horizon.touch.edit.hint": "Drag a control to move it, tap one to change it. Hold a finger down to add a button, copy one or add a keybind. With none picked, the buttons change them all.",
-  "horizon.touch.escape": "Esc",
+  "horizon.touch.escape": "X",
   "horizon.touch.debug": "Debug screen (F3)",
   "horizon.no_resources.ios": "Prepare game files on a computer, copy the resources folder into Horizon in Files, then reopen the app."
 }
