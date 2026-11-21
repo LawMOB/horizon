@@ -123,16 +123,12 @@ impl Game<'_> {
         self.pad.touch.open_editor();
     }
 
-    /// The Esc button: always top left in the safe area, on every screen, as
-    /// the keyboard's Escape (a touch screen has no key for it). Playing, it
-    /// opens the pause menu (where Save and Quit leaves the world); over a
-    /// menu (an inventory, a crafting table, chat, the options) it closes it
-    /// or goes back. Not on the main screen (the title and the menus over it
-    /// have their own Back and Done buttons), and not while the layout editor
-    /// is open (its Done button closes it).
+    /// The inventory close button, at the safe area's top left. Only survival
+    /// and creative inventory screens show it; the layout editor has its own Done.
     fn touch_close_button(&self, batch: &HudBatch) -> Option<Area> {
         if !TOUCH_CONTROLS
             || self.title.is_some()
+            || !matches!(self.screen, Screen::Inventory | Screen::Creative)
             || self.pad.touch.editing()
         {
             return None;
@@ -146,7 +142,7 @@ impl Game<'_> {
         })
     }
 
-    /// The Esc button (`touch_close_button`).
+    /// The inventory close button (`touch_close_button`).
     pub(super) fn draw_touch_close(&self, batch: &mut HudBatch) {
         if let Some(a) = self.touch_close_button(batch) {
             let atlas = &self.gui.atlas;
@@ -182,7 +178,7 @@ impl Game<'_> {
             self.last_input = Instant::now();
             return Vec::new();
         }
-        // The Esc button, top left in a world: Escape's job.
+        // The inventory close button uses the normal back action.
         if !mouse
             && touch.phase == TouchPhase::Started
             && let Some(batch) = self.gui_batch()
@@ -192,7 +188,7 @@ impl Game<'_> {
                 touch.location.y as f32 / batch.scale,
             ))
         {
-            log::info!("Horizon: touch Esc");
+            log::info!("Horizon: touch inventory close");
             if let Err(e) = self.pad_back() {
                 log::warn!("Horizon: closing the menu: {e}");
             }
