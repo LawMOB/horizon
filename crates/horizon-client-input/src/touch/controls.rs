@@ -12,6 +12,9 @@
 //! scale), the units the HUD is drawn in, so the controls keep their size on
 //! every screen, and they stay inside the screen's safe area (clear of the
 //! notch and the home bar).
+mod snapping;
+pub use snapping::{SnapGuide, SnapGuides, SnapSettings};
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use winit::event::TouchPhase;
@@ -611,6 +614,16 @@ impl Layout {
             .expect("every control is laid out")
     }
 
+    /// The scaled artwork bounds, distinct from the joystick's larger touch target.
+    fn rendered_area(&self, item: &Item) -> Area {
+        let area = item.area;
+        if item.control == Control::Stick {
+            Area::around(area.centre(), self.stick_radius * 2.0, self.stick_radius * 2.0)
+        } else {
+            area
+        }
+    }
+
     pub fn hotbar(&self) -> Area {
         self.item(Control::Hotbar).area
     }
@@ -677,22 +690,24 @@ pub enum EditorButton {
     Stronger,
     Hide,
     Reset,
+    Snap,
     Done,
 }
 
 impl EditorButton {
-    pub const ALL: [EditorButton; 7] = [
+    pub const ALL: [EditorButton; 8] = [
         Self::Smaller,
         Self::Bigger,
         Self::Fainter,
         Self::Stronger,
         Self::Hide,
         Self::Reset,
+        Self::Snap,
         Self::Done,
     ];
 
     /// The translation key of its label; `hidden`: the selected control is hidden.
-    pub fn label(self, hidden: bool) -> &'static str {
+    pub fn label(self, hidden: bool, snap_enabled: bool) -> &'static str {
         match self {
             Self::Smaller => "horizon.touch.edit.smaller",
             Self::Bigger => "horizon.touch.edit.bigger",
@@ -701,28 +716,29 @@ impl EditorButton {
             Self::Hide if hidden => "horizon.touch.edit.show",
             Self::Hide => "horizon.touch.edit.hide",
             Self::Reset => "horizon.touch.edit.reset",
+            Self::Snap if snap_enabled => "horizon.touch.edit.snap_on",
+            Self::Snap => "horizon.touch.edit.snap_off",
             Self::Done => "horizon.touch.edit.done",
         }
     }
 
-    /// The toolbar across the safe area, centred, below the top row of buttons.
-    pub fn toolbar(layout: &Layout) -> Vec<(EditorButton, Area)> {
-        let (w, h) = (56.0, 18.0);
-        let total = Self::ALL.len() as f32 * (w + GAP) - GAP;
-        let x0 = (layout.safe.x + (layout.safe.w - total) / 2.0).max(layout.safe.x);
-        Self::ALL
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let area = Area {
-                    x: x0 + i as f32 * (w + GAP),
-                    y: layout.safe.y + GAP + SMALL + GAP * 2.0,
-                    w,
-                    h,
-                };
-                (*b, area)
-            })
-            .collect()
+    /// The toolbar below the top row; wrap on narrow screens without allocating.
+    pub fn toolbar(layout: &Layout) -> [(EditorButton, Area); 8] {
+        let (w, h) = (56.0_f32.min(layout.safe.w.max(0.0)), 18.0);
+        let columns = (((layout.safe.w + GAP) / (w + GAP)) as usize).clamp(1, Self::ALL.len());
+        std::array::from_fn(|i| {
+            let row = i / columns;
+            let count = (Self::ALL.len() - row * columns).min(columns);
+            let total = count as f32 * (w + GAP) - GAP;
+            let area = Area {
+                x: layout.safe.x + (layout.safe.w - total).max(0.0) / 2.0
+                    + (i % columns) as f32 * (w + GAP),
+                y: layout.safe.y + GAP + SMALL + GAP * 2.0 + row as f32 * (h + GAP),
+                w,
+                h,
+            };
+            (Self::ALL[i], area)
+        })
     }
 }
 
@@ -730,8 +746,10 @@ impl EditorButton {
 struct Drag {
     finger: u64,
     control: Control,
-    /// The finger's place less the control's centre when it was picked up.
-    grab: (f32, f32),
+    /// Fixed pointer and artwork origins: snapping never changes the drag baseline.
+    start: (f32, f32),
+    base: Area,
+    guides: SnapGuides,
 }
 
 /// A finger that came down in the editor, for the long press.
@@ -1049,6 +1067,8 @@ pub struct EditorView {
     pub menu: Option<EditorMenu>,
     /// The key picker, while it is open.
     pub picker: Option<Picker>,
+    pub snap_enabled: bool,
+    pub guides: SnapGuides,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1091,6 +1111,8 @@ pub struct TouchFrame {
 pub struct TouchControls {
     /// The layout in use (loaded from the settings file).
     pub settings: TouchSettings,
+    /// Editor preferences; not serialized with HUD coordinates.
+    pub snapping: SnapSettings,
     editor: Option<Editor>,
     /// A layout the editor finished, for the game to save.
     saved: Option<TouchSettings>,
@@ -1129,6 +1151,12 @@ impl TouchControls {
             placement: e.selected.map(|c| e.draft.placement(c)).unwrap_or_default(),
             menu: e.menu,
             picker: e.picker,
+            snap_enabled: self.snapping.enabled,
+            guides: if self.snapping.enabled {
+                e.drag.map_or(SnapGuides::default(), |drag| drag.guides)
+            } else {
+                SnapGuides::default()
+            },
         })
     }
 
@@ -1297,13 +1325,12 @@ impl TouchControls {
                     return;
                 }
                 editor.selected = layout.control_at(at);
-                editor.drag = editor.selected.map(|control| {
-                    let (cx, cy) = layout.item(control).area.centre();
-                    Drag {
-                        finger: id,
-                        control,
-                        grab: (at.0 - cx, at.1 - cy),
-                    }
+                editor.drag = editor.selected.map(|control| Drag {
+                    finger: id,
+                    control,
+                    start: at,
+                    base: layout.rendered_area(layout.item(control)),
+                    guides: SnapGuides::default(),
                 });
                 editor.press = Some(Press {
                     finger: id,
@@ -1327,9 +1354,21 @@ impl TouchControls {
                 };
                 let safe = layout.safe;
                 if safe.w <= 0.0 || safe.h <= 0.0 {
+                    if let Some(active) = editor.drag.as_mut() {
+                        active.guides = SnapGuides::default();
+                    }
                     return;
                 }
-                let (cx, cy) = (at.0 - drag.grab.0, at.1 - drag.grab.1);
+                let raw = Area {
+                    x: drag.base.x + (at.0 - drag.start.0),
+                    y: drag.base.y + (at.1 - drag.start.1),
+                    ..drag.base
+                };
+                let (area, guides) = snapping::snap(layout, drag.control, raw, self.snapping);
+                if let Some(active) = editor.drag.as_mut() {
+                    active.guides = guides;
+                }
+                let (cx, cy) = area.centre();
                 let mut p = editor.draft.placement(drag.control);
                 p.centre = Some((
                     ((cx - safe.x) / safe.w).clamp(0.0, 1.0),
@@ -1466,6 +1505,12 @@ impl TouchControls {
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
+        editor.drag = None;
+        editor.press = None;
+        if button == EditorButton::Snap {
+            self.snapping.enabled = !self.snapping.enabled;
+            return;
+        }
         if button == EditorButton::Done {
             let draft = editor.draft.clone();
             self.settings = draft.clone();
