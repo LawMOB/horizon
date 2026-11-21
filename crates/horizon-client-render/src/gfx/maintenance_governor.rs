@@ -37,11 +37,19 @@ impl Default for Governor {
 }
 
 impl Governor {
-    pub fn allowance(&mut self, uploaded_total: u64) -> Allowance {
+    pub fn allowance(
+        &mut self,
+        uploaded_total: u64,
+        entity_pressure_bytes: u64,
+    ) -> Allowance {
         // Section batches submitted before this frame are included in the delta.
-        let uploaded = uploaded_total.saturating_sub(self.uploaded);
+        // Entity pressure is per-frame: it estimates both staging transfers and
+        // GPU-pose output traffic, and only reduces optional arena relocation.
+        let pressure = uploaded_total
+            .saturating_sub(self.uploaded)
+            .saturating_add(entity_pressure_bytes);
         self.uploaded = uploaded_total;
-        let burst = uploaded >= UPLOAD_BURST;
+        let burst = pressure >= UPLOAD_BURST;
         self.deferred = if burst { self.deferred + 1 } else { 0 };
         // An arena with sustained uploads still gets a chance to reclaim space.
         let start = !burst || self.deferred == MAX_DEFER_FRAMES;
@@ -52,7 +60,7 @@ impl Governor {
             bytes: if burst {
                 MIN_COPY
             } else {
-                self.copy_budget.saturating_sub(uploaded).max(MIN_COPY)
+                self.copy_budget.saturating_sub(pressure).max(MIN_COPY)
             },
             start,
         }
@@ -82,6 +90,39 @@ impl Governor {
     }
 }
 
+/// Estimate the dynamic entity path's per-frame transfer and pose-output traffic.
+/// Required visible geometry still runs; only optional arena maintenance uses this.
+pub(super) fn entity_pressure_bytes(frame: &super::Frame<'_>) -> u64 {
+    let vertex_count = [
+        frame.entities.len(),
+        frame.additive.len(),
+        frame.hand.len(),
+        frame.see_through.len(),
+        frame.shadow_only.len(),
+        frame.glowing.len(),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add) as u64;
+    let vertices = vertex_count.saturating_mul(std::mem::size_of::<super::Vertex>() as u64);
+    let skin = frame.skin.map_or(0, |skin| {
+        let staged = [
+            std::mem::size_of_val(skin.new_model.as_slice()),
+            std::mem::size_of_val(skin.parts.as_slice()),
+            std::mem::size_of_val(skin.jobs.as_slice()),
+            std::mem::size_of_val(skin.outline_jobs.as_slice()),
+        ]
+        .into_iter()
+        .map(|bytes| bytes as u64)
+        .fold(0u64, u64::saturating_add);
+        let posed = u64::from(skin.vertices.saturating_add(skin.outline_vertices))
+            .saturating_mul(std::mem::size_of::<super::Vertex>() as u64);
+        staged.saturating_add(posed)
+    });
+    vertices
+        .saturating_add(skin)
+        .saturating_add(frame.static_block_entity_stats.snapshot_bytes_built)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,32 +132,46 @@ mod tests {
         let mut governor = Governor::default();
         let sample = Duration::from_millis;
         governor.observe(sample(14));
-        assert_eq!(governor.allowance(0).bytes, 4 * MIB);
+        assert_eq!(governor.allowance(0, 0).bytes, 4 * MIB);
         governor.observe(sample(14));
-        assert_eq!(governor.allowance(0).bytes, 2 * MIB);
+        assert_eq!(governor.allowance(0, 0).bytes, 2 * MIB);
         for _ in 0..120 {
             governor.observe(sample(10));
-            assert_eq!(governor.allowance(0).bytes, 2 * MIB);
+            assert_eq!(governor.allowance(0, 0).bytes, 2 * MIB);
         }
         for _ in 0..59 {
             governor.observe(sample(7));
-            assert_eq!(governor.allowance(0).bytes, 2 * MIB);
+            assert_eq!(governor.allowance(0, 0).bytes, 2 * MIB);
         }
         governor.observe(sample(7));
-        assert_eq!(governor.allowance(0).bytes, 3 * MIB);
+        assert_eq!(governor.allowance(0, 0).bytes, 3 * MIB);
     }
 
     #[test]
     fn uploads_take_priority_but_cannot_starve_reclamation() {
         let mut governor = Governor::default();
         for frame in 1..120 {
-            let allowance = governor.allowance(frame * 3 * MIB);
+            let allowance = governor.allowance(frame * 3 * MIB, 0);
             assert_eq!(allowance.bytes, MIB / 2);
             assert!(!allowance.start);
         }
-        assert!(governor.allowance(120 * 3 * MIB).start);
-        assert!(!governor.allowance(121 * 3 * MIB).start);
-        assert!(!governor.allowance(239 * 3 * MIB).start);
-        assert!(governor.allowance(240 * 3 * MIB).start);
+        assert!(governor.allowance(120 * 3 * MIB, 0).start);
+        assert!(!governor.allowance(121 * 3 * MIB, 0).start);
+        assert!(!governor.allowance(239 * 3 * MIB, 0).start);
+        assert!(governor.allowance(240 * 3 * MIB, 0).start);
+    }
+
+    #[test]
+    fn entity_pressure_defers_optional_reclamation() {
+        let mut governor = Governor::default();
+        let allowance = governor.allowance(0, 3 * MIB);
+        assert_eq!(allowance.bytes, MIN_COPY);
+        assert!(!allowance.start);
+
+        // Required entity work still runs in the renderer. With its burst gone,
+        // the maintenance budget recovers immediately.
+        let allowance = governor.allowance(0, 0);
+        assert_eq!(allowance.bytes, ROOMY_COPY);
+        assert!(allowance.start);
     }
 }
