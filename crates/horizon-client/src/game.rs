@@ -5541,8 +5541,8 @@ impl Game<'_> {
                     &mut out,
                 );
             }
+            self.shadow_casters_scratch = casters;
         }
-        self.shadow_casters_scratch = casters;
         laps.lap("eg_shadows");
         // Block entities (BlockEntityRenderers): chests, shulker boxes, banners, skulls...
         if let Some(r) = &self.renderer {
