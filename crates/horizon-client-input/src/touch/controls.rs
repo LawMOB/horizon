@@ -141,7 +141,7 @@ pub struct CustomButton {
 /// The most buttons a player can add.
 pub const MAX_CUSTOM: usize = 24;
 
-/// Something the layout editor moves: a button, the movement stick or the hotbar.
+/// Something the layout editor moves: a gameplay control or the inventory close button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Control {
     Button(TouchButton),
@@ -149,6 +149,8 @@ pub enum Control {
     Custom(u32),
     Stick,
     Hotbar,
+    /// The inventory close button, shown here for placement and in inventory for use.
+    Close,
 }
 
 impl Control {
@@ -158,7 +160,7 @@ impl Control {
         TouchButton::PLACED
             .into_iter()
             .map(Control::Button)
-            .chain([Control::Stick, Control::Hotbar])
+            .chain([Control::Stick, Control::Hotbar, Control::Close])
     }
 
     fn key(self) -> &'static str {
@@ -167,6 +169,7 @@ impl Control {
             Self::Custom(_) => "custom",
             Self::Stick => "stick",
             Self::Hotbar => "hotbar",
+            Self::Close => "close",
         }
     }
 
@@ -187,17 +190,18 @@ impl Control {
             Self::Custom(_) => "horizon.touch.custom",
             Self::Stick => "horizon.touch.stick",
             Self::Hotbar => "horizon.touch.hotbar",
+            Self::Close => "horizon.touch.close",
         }
     }
 
-    /// The hotbar keeps vanilla's size.
+    /// The hotbar and inventory close button keep their sizes.
     pub fn resizable(self) -> bool {
-        self != Self::Hotbar
+        !matches!(self, Self::Hotbar | Self::Close)
     }
 
-    /// The hotbar always shows.
+    /// The hotbar and inventory close button must stay reachable.
     pub fn hideable(self) -> bool {
-        self != Self::Hotbar
+        !matches!(self, Self::Hotbar | Self::Close)
     }
 }
 
@@ -240,6 +244,18 @@ pub struct TouchSettings {
 }
 
 impl TouchSettings {
+    /// The inventory close button, shared by the editor, drawing and hit testing.
+    /// Resolving this one control does not allocate a complete HUD layout.
+    pub fn close_button(&self, safe: Area) -> Item {
+        let placement = self.placement(Control::Close);
+        Item {
+            control: Control::Close,
+            area: close_area(safe, placement),
+            opacity: placement.opacity,
+            hidden: false,
+        }
+    }
+
     pub fn placement(&self, control: Control) -> Placement {
         self.placements.get(&control).copied().unwrap_or_default()
     }
@@ -462,6 +478,16 @@ const PULSE: Duration = Duration::from_millis(60);
 const SPRINT_ON: f32 = 0.8;
 const SPRINT_OFF: f32 = 0.3;
 
+/// The inventory close button keeps its size and stays reachable within the safe area.
+fn close_area(safe: Area, placement: Placement) -> Area {
+    let (w, h) = (28.0, 20.0);
+    let centre = placement.centre.map_or(
+        (safe.x + GAP + w / 2.0, safe.y + GAP + h / 2.0),
+        |(x, y)| (safe.x + x * safe.w, safe.y + y * safe.h),
+    );
+    Area::around(centre, w, h).kept_in(safe)
+}
+
 /// One control as laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Item {
@@ -508,6 +534,10 @@ impl Layout {
             h: height,
         };
         for item in &mut layout.items {
+            if item.control == Control::Close {
+                *item = settings.close_button(safe);
+                continue;
+            }
             let p = settings.placement(item.control);
             let size = if item.control.resizable() {
                 p.size
@@ -586,6 +616,7 @@ impl Layout {
             },
             Control::Stick => stick,
             Control::Hotbar => hotbar,
+            Control::Close => close_area(safe, Placement::default()),
             // The player's own buttons are laid out by `Layout::new`.
             Control::Custom(_) => big(safe.x, safe.y),
         };
@@ -668,7 +699,7 @@ impl Layout {
     pub fn control_at(&self, at: (f32, f32)) -> Option<Control> {
         let rank = |c: Control| match c {
             Control::Custom(_) => 0,
-            Control::Button(_) => 1,
+            Control::Button(_) | Control::Close => 1,
             Control::Hotbar => 2,
             Control::Stick => 3,
         };
