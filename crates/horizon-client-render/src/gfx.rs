@@ -7322,7 +7322,10 @@ impl Renderer {
             .maintenance_governor
             .as_mut()
             .map_or((COMPACT_BUDGET, true), |governor| {
-                let allowance = governor.allowance(self.uploaded_bytes);
+                let allowance = governor.allowance(
+                    self.uploaded_bytes,
+                    maintenance_governor::entity_pressure_bytes(frame),
+                );
                 (allowance.bytes, allowance.start)
             });
         #[cfg(not(target_os = "ios"))]
