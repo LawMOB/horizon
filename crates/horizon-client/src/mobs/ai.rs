@@ -2493,7 +2493,10 @@ fn push_entities(
     let bounds = m.bounds();
     // The pusher's own isPushable and isVehicle, checked by `e.push(this)`.
     let self_pushable = m.pushable() && !super::equine::is_vehicle(m);
-    // Each passenger with whether it shares this one's root vehicle.
+    // EntitySelector.pushableBy(this): the teams' collision rules. Filter before computing
+    // root-vehicle relationships, which require walking passenger links for each mob candidate.
+    let own = w.teams.of(Who::Mob(m.id));
+    let root = root_vehicle(w, m.id, m.extra.mount);
     let mut targets = super::world::take_push_targets();
     if let Some(p) = w.selected_player()
         // Entity.push: passengers of the same vehicle never push each other.
@@ -2501,19 +2504,21 @@ fn push_entities(
         && p.alive
         && !p.spectator
         && p.bounds.intersects(bounds)
+        && crate::scoreboard::pushable_by(own, w.teams.of(Who::Player), true)
     {
         targets.push((Who::Player, p.position, p.passenger, false, false));
     }
-    let root = root_vehicle(w, m.id, m.extra.mount);
     for o in w.others_near(bounds) {
-        if o.id != m.id && o.alive && o.pushable && o.bounds.intersects(bounds) {
+        if o.id != m.id
+            && o.alive
+            && o.pushable
+            && o.bounds.intersects(bounds)
+            && crate::scoreboard::pushable_by(own, w.teams.of(Who::Mob(o.id)), true)
+        {
             let same = root_vehicle(w, o.id, o.vehicle) == root;
             targets.push((Who::Mob(o.id), o.position, o.passenger, same, o.is_vehicle));
         }
     }
-    // EntitySelector.pushableBy(this): the teams' collision rules.
-    let own = w.teams.of(Who::Mob(m.id));
-    targets.retain(|(who, ..)| crate::scoreboard::pushable_by(own, w.teams.of(*who), true));
     // Cramming: a quarter of the ticks spent with `maxEntityCramming` or more
     // others around that are not riding anything hurts it by 6.
     let limit = w.max_entity_cramming;
