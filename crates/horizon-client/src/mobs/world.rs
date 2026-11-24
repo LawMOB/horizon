@@ -56,6 +56,7 @@ pub(super) fn give_push_targets(targets: Vec<PushTarget>) {
 pub struct NearIter<'a> {
     others: &'a [Seen],
     indices: Option<Vec<u32>>,
+    borrowed: Option<&'a [u32]>,
     pos: usize,
     fallback: Option<std::slice::Iter<'a, Seen>>,
 }
@@ -65,6 +66,13 @@ impl<'a> Iterator for NearIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(indices) = self.borrowed
+            && self.pos < indices.len()
+        {
+            let idx = indices[self.pos];
+            self.pos += 1;
+            return Some(&self.others[idx as usize]);
+        }
         if let Some(indices) = &self.indices
             && self.pos < indices.len()
         {
@@ -80,7 +88,10 @@ impl<'a> Iterator for NearIter<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if let Some(indices) = &self.indices {
+        if let Some(indices) = self.borrowed {
+            let rem = indices.len().saturating_sub(self.pos);
+            (rem, Some(rem))
+        } else if let Some(indices) = &self.indices {
             let rem = indices.len().saturating_sub(self.pos);
             (rem, Some(rem))
         } else if let Some(all) = &self.fallback {
@@ -664,6 +675,18 @@ impl MobWorld<'_> {
     /// The other mobs whose boxes may meet `area` (callers test the boxes),
     /// in snapshot order: through the grid when there is one, else all.
     pub fn others_near(&self, area: Aabb) -> NearIter<'_> {
+        if let Some(indices) = self
+            .others_grid
+            .and_then(|grid| grid.single_cell_candidates(area))
+        {
+            return NearIter {
+                others: self.others,
+                indices: None,
+                borrowed: Some(indices),
+                pos: 0,
+                fallback: None,
+            };
+        }
         let mut buf = NEAR_BUF_POOL.with(|pool| {
             pool.try_borrow_mut()
                 .ok()
@@ -677,6 +700,7 @@ impl MobWorld<'_> {
             NearIter {
                 others: self.others,
                 indices: Some(buf),
+                borrowed: None,
                 pos: 0,
                 fallback: None,
             }
@@ -692,6 +716,7 @@ impl MobWorld<'_> {
             NearIter {
                 others: self.others,
                 indices: None,
+                borrowed: None,
                 pos: 0,
                 fallback: Some(self.others.iter()),
             }
