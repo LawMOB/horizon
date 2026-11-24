@@ -105,6 +105,18 @@ impl SeenGrid {
         let c = self.cell_of[i as usize];
         lo.0 <= c.0 && c.0 <= hi.0 && lo.1 <= c.1 && c.1 <= hi.1
     }
+    /// Borrow the candidates when `area` reaches only one grid cell.
+    ///
+    /// The cell slice is already sorted in snapshot order, so callers can iterate it without
+    /// allocating or copying a temporary candidate list. `None` retains the normal multi-cell or
+    /// full-scan path.
+    pub fn single_cell_candidates(&self, area: Aabb) -> Option<&[u32]> {
+        let ((lo_x, lo_z), (hi_x, hi_z)) = self.admission(area)?;
+        if lo_x != hi_x || lo_z != hi_z {
+            return None;
+        }
+        Some(self.cells.get(&(lo_x, lo_z)).map_or(&[], Vec::as_slice))
+    }
     /// The indices, ascending, of every entry whose box can meet `area`
     /// (a superset: callers still test it). False when the area spans more
     /// columns than the grid has entries (at least 64), or is not finite:
@@ -342,6 +354,29 @@ mod tests {
         let q4 = Aabb::new(Vec3::new(0.0, 64.0, 0.0), Vec3::new(6.0, 66.0, 6.0));
         assert!(grid.candidates(q4, &mut out));
         assert_eq!(out, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn single_cell_candidates_borrow_the_ordered_cell_slice() {
+        let boxes = vec![
+            boxed(10.2, 64.0, 10.2, 0.6),
+            boxed(10.8, 64.0, 10.8, 0.6),
+            boxed(14.5, 64.0, 14.5, 0.6),
+        ];
+        let grid = SeenGrid::new(boxes.into_iter());
+        let one_cell = Aabb::new(Vec3::new(10.1, 64.0, 10.1), Vec3::new(11.5, 66.0, 11.5));
+        let mut owned = Vec::new();
+        assert!(grid.candidates(one_cell, &mut owned));
+        assert_eq!(
+            grid.single_cell_candidates(one_cell).map(|ids| ids.to_vec()),
+            Some(owned)
+        );
+
+        let multiple_cells = Aabb::new(
+            Vec3::new(10.1, 64.0, 10.1),
+            Vec3::new(14.5, 66.0, 14.5),
+        );
+        assert!(grid.single_cell_candidates(multiple_cells).is_none());
     }
 
     #[test]
