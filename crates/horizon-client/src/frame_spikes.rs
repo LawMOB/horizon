@@ -35,6 +35,26 @@ struct FrameSample {
 }
 
 #[derive(Clone, Copy, Default)]
+struct FramePacingSample {
+    frame_id: u64,
+    frame_start_ns: u64,
+    previous_work: Duration,
+    previous_render_wait: Duration,
+    previous_frame_tail: Duration,
+    redraw_delivery: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FramePacingState {
+    frame_id: u64,
+    previous_work: Duration,
+    previous_render_wait: Duration,
+    redraw_requested_at_ns: Option<u64>,
+    tail_started_at_ns: Option<u64>,
+    previous_frame_tail_ns: u64,
+}
+
+#[derive(Clone, Copy, Default)]
 struct ServerTickParts {
     mobs_ns: u64,
     collision_push_ns: u64,
@@ -76,6 +96,15 @@ thread_local! {
         save_ns: 0,
     }) };
     static LAST_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
+    static PACING_SAMPLE: Cell<Option<FramePacingSample>> = const { Cell::new(None) };
+    static PACING: Cell<FramePacingState> = const { Cell::new(FramePacingState {
+        frame_id: 0,
+        previous_work: Duration::ZERO,
+        previous_render_wait: Duration::ZERO,
+        redraw_requested_at_ns: None,
+        tail_started_at_ns: None,
+        previous_frame_tail_ns: 0,
+    }) };
 }
 
 static SERVER_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -86,6 +115,14 @@ static SERVER_GRID_NS: AtomicU64 = AtomicU64::new(0);
 static SERVER_SAVE_NS: AtomicU64 = AtomicU64::new(0);
 static SERVER_AT_NS: AtomicU64 = AtomicU64::new(0);
 static STARTED: OnceLock<Instant> = OnceLock::new();
+static PACING_PROBE: OnceLock<bool> = OnceLock::new();
+
+fn pacing_probe_enabled() -> bool {
+    *PACING_PROBE.get_or_init(|| {
+        std::env::var("HORIZON_FRAME_PACING_TRACE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true"))
+    })
+}
 
 #[inline]
 fn clock_ns() -> u64 {
@@ -107,6 +144,47 @@ fn update_frame(update: impl FnOnce(&mut FrameSample)) {
 /// Start a fixed-size frame sample on the render thread.
 pub fn begin() {
     FRAME.with(|sample| sample.set(FrameSample::default()));
+    if !pacing_probe_enabled() {
+        return;
+    }
+    let pacing = PACING.with(|cell| {
+        let mut state = cell.get();
+        state.frame_id = state.frame_id.saturating_add(1);
+        let now_ns = clock_ns();
+        let sample = FramePacingSample {
+            frame_id: state.frame_id,
+            frame_start_ns: now_ns,
+            previous_work: state.previous_work,
+            previous_render_wait: state.previous_render_wait,
+            previous_frame_tail: Duration::from_nanos(state.previous_frame_tail_ns),
+            redraw_delivery: state
+                .redraw_requested_at_ns
+                .take()
+                .map(|at| Duration::from_nanos(now_ns.saturating_sub(at))),
+        };
+        state.previous_frame_tail_ns = 0;
+        cell.set(state);
+        sample
+    });
+    PACING_SAMPLE.with(|sample| sample.set(Some(pacing)));
+}
+
+/// Record the first pending redraw request and the time spent in the frame-loop tail.
+pub fn redraw_requested() {
+    if !pacing_probe_enabled() {
+        return;
+    }
+    PACING.with(|cell| {
+        let mut state = cell.get();
+        if state.redraw_requested_at_ns.is_none() {
+            let now_ns = clock_ns();
+            state.redraw_requested_at_ns = Some(now_ns);
+            if let Some(started_at_ns) = state.tail_started_at_ns.take() {
+                state.previous_frame_tail_ns = now_ns.saturating_sub(started_at_ns);
+            }
+            cell.set(state);
+        }
+    });
 }
 
 #[inline]
@@ -269,8 +347,8 @@ fn append_line(line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Log slow frames only. Renderer wait includes acquisition, queue back-pressure and present;
-/// render CPU time is separate and is never interpreted as CPU work.
+/// Log slow frames only. The interval ends at this frame's start; work/render durations
+/// describe the current callback. Work is wall time minus known renderer waits, not CPU usage.
 pub fn finish(
     frame_time: Duration,
     frame_cpu: Duration,
@@ -279,6 +357,15 @@ pub fn finish(
     resident_chunks: usize,
     pending_uploads: usize,
 ) {
+    if pacing_probe_enabled() {
+        PACING.with(|cell| {
+            let mut state = cell.get();
+            state.previous_work = frame_cpu;
+            state.previous_render_wait = render_wait;
+            state.tail_started_at_ns = Some(clock_ns());
+            cell.set(state);
+        });
+    }
     if ms(frame_time) < FRAME_SPIKE_MS || !permit_log(Instant::now()) {
         return;
     }
@@ -328,6 +415,20 @@ pub fn finish(
         ms(sample.shadow_casters),
         sample.shadow_caster_count,
     );
+    let line = if let Some(pacing) = PACING_SAMPLE.with(Cell::get) {
+        format!(
+            "{line} frame_id={} interval_from_frame_id={} frame_start_monotonic_ns={} prior_frame_work_ms={:.2} prior_render_wait_ms={:.2} prior_frame_tail_ms={:.2} redraw_delivery_ms={:.2}",
+            pacing.frame_id,
+            pacing.frame_id.saturating_sub(1),
+            pacing.frame_start_ns,
+            ms(pacing.previous_work),
+            ms(pacing.previous_render_wait),
+            ms(pacing.previous_frame_tail),
+            pacing.redraw_delivery.map_or(-1.0, ms),
+        )
+    } else {
+        line
+    };
     log::warn!("{line}");
     if let Err(error) = append_line(&line) {
         log::warn!("Horizon: couldn't append frame spike diagnostic: {error}");
