@@ -360,6 +360,7 @@ impl Game<'_> {
                     input_trace::InputOrigin::Game,
                 );
             } else {
+                horizon_client::frame_spikes::redraw_requested();
                 w.request_redraw();
             }
         } else if self.options.headless {
