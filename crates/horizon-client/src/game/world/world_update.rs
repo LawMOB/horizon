@@ -332,6 +332,8 @@ impl Game<'_> {
             .map(|p| [p.position.x, p.position.y, p.position.z])
             .and_then(|camera| self.lod_aim(camera));
         if let Some(renderer) = self.renderer.as_mut() {
+            let upload_started = Instant::now();
+            let mut upload_bytes = 0u64;
             let g = &self.settings.horizon;
             let budgeted = g.chunk_updates > 0 || g.upload_budget_kib > 0;
             // The meshes, once copied, are freed by a worker (`Streaming::free`).
@@ -339,6 +341,11 @@ impl Game<'_> {
             {
                 horizon_client::spans::time("upload", || {
                     for (key, mesh) in &uploads {
+                        upload_bytes = upload_bytes.saturating_add(
+                            ((mesh.solid.len() + mesh.translucent.len())
+                                * std::mem::size_of::<horizon_client::mesher::TerrainVertex>())
+                                as u64,
+                        );
                         renderer.upload(*key, mesh);
                     }
                 });
@@ -404,6 +411,7 @@ impl Game<'_> {
                     }
                     let (key, mesh) = pending.pop().expect("checked above");
                     renderer.upload(key, &mesh);
+                    upload_bytes = upload_bytes.saturating_add(size);
                     spent.push((key, mesh));
                     count += 1;
                     bytes += size;
@@ -411,6 +419,7 @@ impl Game<'_> {
                 drop(upload_span);
                 self.streaming.free(spent);
             }
+            horizon_client::frame_spikes::chunk_upload(upload_started.elapsed(), upload_bytes);
             renderer.remove_columns(unloaded.iter().map(|c| (c.x, c.z)));
             // Sections whose mesh the arena refused: meshed again, as an edit's section
             // is, once their retry comes due. The mesh is dropped with the uploads above,
