@@ -133,8 +133,11 @@ impl Game<'_> {
         let mut pushes = std::mem::take(state.pushes);
         let original_len = snapshot.len();
         let mut keep = vec![true; original_len];
+        let mut grid_time = std::time::Duration::ZERO;
+        let grid_started = std::time::Instant::now();
         let mut grid =
             horizon_client::mobs::seen_grid::SeenGrid::new(snapshot.iter().map(|s| s.bounds));
+        grid_time += grid_started.elapsed();
         // Snapshot slots stay stable even if a full-host listener removes an
         // earlier row or adds a new one. Only that rare boundary needs a map
         // from stable identities to the owning list's current positions.
@@ -648,7 +651,9 @@ impl Game<'_> {
                     }
                     snapshot[slot].alive &= kept;
                     snapshot[slot].removed |= !kept;
+                    let grid_started = std::time::Instant::now();
                     grid.update(slot, snapshot[slot].bounds);
+                    grid_time += grid_started.elapsed();
                     horizon_client::mobs::apply_brain_events(
                         &mut mobs,
                         &mut level,
@@ -763,8 +768,10 @@ impl Game<'_> {
                     solid_slots.push(slot as u32);
                 }
             }
+            let grid_started = std::time::Instant::now();
             grid =
                 horizon_client::mobs::seen_grid::SeenGrid::new(snapshot.iter().map(|s| s.bounds));
+            grid_time += grid_started.elapsed();
             positions = Some(current);
             if let Some(writes) = self.world.path_writes.as_mut() {
                 path_writes.append(writes);
@@ -773,6 +780,7 @@ impl Game<'_> {
             resuming = retry_rider.is_none() && !section_yield;
             retried_rider = retry_rider;
         }
+        horizon_client::frame_spikes::server_grid(grid_time);
         laps.lap("creature_loop");
         if dispatch_panic.is_none() {
             if !self.persist.off_level.is_empty() {
