@@ -6630,13 +6630,12 @@ impl Game<'_> {
             return Vec3::ZERO;
         }
         let bounds = p.bounds();
-        let teams = self.mob_teams();
-        // `Entity.getTeam` is `Scoreboard.getPlayersTeam(getScoreboardName())`:
-        // a player's score holder is its profile name, every other entity's
-        // its UUID text. `mob_teams` keys by UUID and names the local player
-        // `PLAYER_NAME`, which misses a server's teams for players.
         let board = &self.score.board;
         let player_team = board.players_team(&r.profile_name);
+        let has_team_members = !board.teams.is_empty() && board.team_members().next().is_some();
+        // The mob scan below may find no overlap at all. Resolve mob teams only after
+        // the exact bounds test, instead of building a team map for every mob twice
+        // per tick. `mob_team_of` retains the own-team and tamed-owner rules.
         let mut push = Vec3::ZERO;
         let order = |id: u32| r.ticked_before_player.contains(&id) == before_player;
         for m in self.mobs.iter().filter(|m| order(m.id)) {
@@ -6655,8 +6654,13 @@ impl Game<'_> {
                 .level_players
                 .get(&(m.id as i32))
                 .and_then(|uuid| r.tab_players.get(uuid));
-            let mob_team =
-                listed.map_or_else(|| teams.of(Who::Mob(m.id)), |t| board.players_team(&t.name));
+            let mob_team = if let Some(t) = listed {
+                board.players_team(&t.name)
+            } else if has_team_members {
+                self.mob_team_of(m)
+            } else {
+                None
+            };
             if listed.is_some_and(|t| t.game_mode == SPECTATOR)
                 || !horizon_client::scoreboard::pushable_by(mob_team, player_team, true)
             {
