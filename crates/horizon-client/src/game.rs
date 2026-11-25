@@ -4404,20 +4404,32 @@ impl Game<'_> {
         cancel
     }
     fn tick(&mut self) -> Result<()> {
-        self.expire_client_cracks();
-        if self.agent.hold_server {
-            return Ok(());
-        }
-        self.abort_open_transactions();
-        self.update_interaction_ranges();
-        // A logical server has no window to lead and never follows another server.
-        if !self.is_logical_server() {
-            self.tick_client_lead()?;
-            if self.remote.is_some() {
-                return self.with_residency_tick(Self::tick_remote);
+        let server_started = if self.is_logical_server() {
+            horizon_client::frame_spikes::begin_server_tick();
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let result = (|| -> Result<()> {
+            self.expire_client_cracks();
+            if self.agent.hold_server {
+                return Ok(());
             }
+            self.abort_open_transactions();
+            self.update_interaction_ranges();
+            // A logical server has no window to lead and never follows another server.
+            if !self.is_logical_server() {
+                self.tick_client_lead()?;
+                if self.remote.is_some() {
+                    return self.with_residency_tick(Self::tick_remote);
+                }
+            }
+            self.tick_first_level()
+        })();
+        if let Some(started) = server_started {
+            horizon_client::frame_spikes::finish_server_tick(started.elapsed());
         }
-        self.tick_first_level()
+        result
     }
     /// What the tick runs after the local player's own update: effects, the
     /// world's entities and blocks, and the network hub.
@@ -4472,7 +4484,11 @@ impl Game<'_> {
         }
         // ChunkMap still ticks while /tick freeze holds block/entity ticks.
         if !running {
+            let save_started = self.is_logical_server().then(Instant::now);
             span("save_chunks_eagerly", || self.save_chunks_eagerly());
+            if let Some(started) = save_started {
+                horizon_client::frame_spikes::server_save(started.elapsed());
+            }
         }
         self.begin_ordered_ticks();
         if running {
@@ -5386,7 +5402,9 @@ impl Game<'_> {
         self.ominous_item_spawner_geometry(camera, alpha, &mut out);
         laps.lap("eg_items_misc");
         // Mobs and their projectiles (a span each).
+        let mob_geometry_started = Instant::now();
         self.mob_geometry(camera, alpha, &mut out);
+        horizon_client::frame_spikes::mob_geometry(mob_geometry_started.elapsed());
         self.mark_motion(out.len(), 0);
         for m in self.drawn_mobs() {
             // Blaze.isOnFire: a charged blaze burns.
@@ -5480,6 +5498,8 @@ impl Game<'_> {
         let shadow_sprite = (shadows && !pack_shadows)
             .then(|| self.gui.atlas.sprites.get("misc/shadow").copied())
             .flatten();
+        let shadow_started = Instant::now();
+        let mut shadow_count = 0usize;
         if let Some(sprite) = shadow_sprite {
             let ambient = self.dimension_type().ambient_light;
             let darken = self.sky_darken();
@@ -5513,6 +5533,7 @@ impl Game<'_> {
                 .view_frustum
                 .as_ref()
                 .filter(|_| self.pack_ids.is_none() && self.native_shaders.picked.is_empty());
+            shadow_count = casters.len();
             for &(pos, radius, strength) in &casters {
                 if let Some(view) = shadow_view
                     && !horizon_client::shadows::in_view(view, camera, pos, radius, strength)
@@ -5543,8 +5564,11 @@ impl Game<'_> {
             }
             self.shadow_casters_scratch = casters;
         }
+        horizon_client::frame_spikes::shadow_casters(shadow_started.elapsed(), shadow_count);
         laps.lap("eg_shadows");
         // Block entities (BlockEntityRenderers): chests, shulker boxes, banners, skulls...
+        let block_entity_started = Instant::now();
+        let mut visible_block_entity_count = 0usize;
         if let Some(r) = &self.renderer {
             // Block entities outside the view frustum are skipped (with a
             // block of margin for models larger than their block).
@@ -5595,6 +5619,7 @@ impl Game<'_> {
                 } else {
                     Vec::new()
                 };
+            visible_block_entity_count = camera_list.len() + shadow_only.len();
             let shadow_only_at: HashSet<[i32; 3]> = shadow_only.iter().map(|b| b.0).collect();
             let dynamic_visible = |pos: [i32; 3], state: u32, lo: glam::DVec3, hi: glam::DVec3| {
                 if off_screen(state) || shadow_only_at.contains(&pos) {
@@ -5742,6 +5767,10 @@ impl Game<'_> {
                     .render_breaking(&scene, pos, state.0, stage, &mut out);
             }
         }
+        horizon_client::frame_spikes::block_entities(
+            block_entity_started.elapsed(),
+            visible_block_entity_count,
+        );
         laps.lap("eg_block_entities");
         self.mark_entity(out.len(), "minecraft:experience_orb");
         let orb_view = billboard_frustum
@@ -6206,7 +6235,12 @@ impl Game<'_> {
     }
     fn tick_mobs(&mut self) -> Result<()> {
         self.sync_mob_death_protection();
-        self.tick_creatures()?;
+        let mob_started = self.is_logical_server().then(Instant::now);
+        let mob_tick = self.tick_creatures();
+        if let Some(started) = mob_started {
+            horizon_client::frame_spikes::server_mobs(started.elapsed());
+        }
+        mob_tick?;
         if !self.entity_attachments.is_empty() {
             self.prune_entity_attachments();
         }
@@ -8506,10 +8540,12 @@ impl Game<'_> {
             self.shader_pack_inputs(camera, alpha as f32, &sky)
         };
         if !title {
+            let entity_prep_started = Instant::now();
             let (built, static_sections, visible_static_sections, static_stats) =
                 spans::time("entity_geometry", || {
                     self.entity_geometry(camera, alpha, billboard_frustum, entities)
                 });
+            horizon_client::frame_spikes::entity_prep(entity_prep_started.elapsed(), built.len());
             entities = built;
             static_block_entities = static_sections;
             visible_static_block_entity_sections = visible_static_sections;
@@ -10134,6 +10170,7 @@ impl Game<'_> {
                     self.observe_fullscreen();
                     self.sync_ime();
                     let now = Instant::now();
+                    horizon_client::frame_spikes::begin();
                     horizon_threads::work::tick_start();
                     let elapsed = now.duration_since(self.previous);
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
@@ -10173,8 +10210,10 @@ impl Game<'_> {
                     let steps = self.clock.advance(elapsed, target);
                     // Once per frame, whatever `steps` is: `tick` never runs on the title, and a frame with
                     // no client tick would leave a queued `request_world` waiting. The title draws after this.
+                    let client_tick_started = horizon_client::frame_spikes::started();
                     self.drain_native_world_request()?;
                     self.client_tick_steps(steps, Some(event_loop))?;
+                    horizon_client::frame_spikes::client_tick(client_tick_started.elapsed());
                     self.extras_frame(elapsed);
                     self.extras_retry()?;
                     self.apply_mouse_look();
@@ -10194,6 +10233,14 @@ impl Game<'_> {
                     let mut perf_times = None;
                     if let Some(r) = self.renderer.as_mut() {
                         let cpu = now.elapsed().saturating_sub(r.last_wait);
+                        horizon_client::frame_spikes::finish(
+                            elapsed,
+                            cpu,
+                            r.last_encode,
+                            r.last_wait,
+                            self.world.chunks.len(),
+                            self.pending_uploads.len(),
+                        );
                         horizon_threads::work::tick_end(cpu.as_nanos() as u64);
                         if rendered {
                             let ms = |d: Duration| d.as_secs_f32() * 1000.0;
