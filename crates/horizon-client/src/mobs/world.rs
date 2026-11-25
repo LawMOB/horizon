@@ -675,51 +675,43 @@ impl MobWorld<'_> {
     /// The other mobs whose boxes may meet `area` (callers test the boxes),
     /// in snapshot order: through the grid when there is one, else all.
     pub fn others_near(&self, area: Aabb) -> NearIter<'_> {
-        if let Some(indices) = self
-            .others_grid
-            .and_then(|grid| grid.single_cell_candidates(area))
-        {
-            return NearIter {
-                others: self.others,
-                indices: None,
-                borrowed: Some(indices),
-                pos: 0,
-                fallback: None,
-            };
-        }
-        let mut buf = NEAR_BUF_POOL.with(|pool| {
-            pool.try_borrow_mut()
-                .ok()
-                .and_then(|mut p| p.pop())
-                .unwrap_or_default()
-        });
-        let indexed = self
-            .others_grid
-            .is_some_and(|grid| grid.candidates(area, &mut buf));
-        if indexed {
-            NearIter {
-                others: self.others,
-                indices: Some(buf),
-                borrowed: None,
-                pos: 0,
-                fallback: None,
-            }
-        } else {
-            buf.clear();
-            NEAR_BUF_POOL.with(|pool| {
-                if let Ok(mut pool) = pool.try_borrow_mut()
-                    && pool.len() < 8
-                {
-                    pool.push(buf);
+        if let Some(grid) = self.others_grid {
+            let grid_started = std::time::Instant::now();
+            if let Some((lo, hi)) = grid.admission(area) {
+                if lo == hi {
+                    crate::frame_spikes::server_grid(grid_started.elapsed());
+                    return NearIter {
+                        others: self.others,
+                        indices: None,
+                        borrowed: Some(grid.cell_candidates(lo)),
+                        pos: 0,
+                        fallback: None,
+                    };
                 }
-            });
-            NearIter {
-                others: self.others,
-                indices: None,
-                borrowed: None,
-                pos: 0,
-                fallback: Some(self.others.iter()),
+                let mut buf = NEAR_BUF_POOL.with(|pool| {
+                    pool.try_borrow_mut()
+                        .ok()
+                        .and_then(|mut p| p.pop())
+                        .unwrap_or_default()
+                });
+                grid.candidates_in_columns((lo, hi), &mut buf);
+                crate::frame_spikes::server_grid(grid_started.elapsed());
+                return NearIter {
+                    others: self.others,
+                    indices: Some(buf),
+                    borrowed: None,
+                    pos: 0,
+                    fallback: None,
+                };
             }
+            crate::frame_spikes::server_grid(grid_started.elapsed());
+        }
+        NearIter {
+            others: self.others,
+            indices: None,
+            borrowed: None,
+            pos: 0,
+            fallback: Some(self.others.iter()),
         }
     }
     /// A passenger edge can name an object refused level residency.
