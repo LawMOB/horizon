@@ -83,6 +83,8 @@ pub mod entities;
 pub mod entity_nbt;
 pub mod entity_rules;
 pub mod extras_hud;
+#[doc(hidden)]
+pub mod frame_spikes;
 pub mod falling_block;
 pub mod fire_render;
 pub mod first_person;
