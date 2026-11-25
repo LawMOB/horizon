@@ -4,6 +4,7 @@ use std::{
     cell::Cell,
     fs::{self, OpenOptions},
     io::Write,
+    path::Path,
     sync::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -117,11 +118,37 @@ static SERVER_AT_NS: AtomicU64 = AtomicU64::new(0);
 static STARTED: OnceLock<Instant> = OnceLock::new();
 static PACING_PROBE: OnceLock<bool> = OnceLock::new();
 
+/// Called once after launch has selected the player folder and initialized logging.
+/// Both switches are opt-in; reading the file and writing the session marker happen at startup.
+pub fn init(config_dir: &Path) {
+    PACING_PROBE.get_or_init(|| {
+        let configured = fs::read_to_string(config_dir.join(horizon_client::graphics::FILE))
+            .map(|text| horizon_client::graphics::Graphics::parse(&text).frame_pacing_trace)
+            .unwrap_or(false);
+        let environment = std::env::var("HORIZON_FRAME_PACING_TRACE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+        let enabled = environment || configured;
+        let source = if environment {
+            "environment"
+        } else if configured {
+            "horizon-graphics.txt"
+        } else {
+            "default"
+        };
+        let line = format!(
+            "Horizon frame pacing trace schema=2 enabled={enabled} source={source} env_enabled={environment} config_enabled={configured} pid={}",
+            std::process::id(),
+        );
+        log::info!("{line}");
+        if let Err(error) = append_line(&line) {
+            log::warn!("Horizon: couldn't append frame pacing session marker: {error}");
+        }
+        enabled
+    });
+}
+
 fn pacing_probe_enabled() -> bool {
-    *PACING_PROBE.get_or_init(|| {
-        std::env::var("HORIZON_FRAME_PACING_TRACE")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true"))
-    })
+    PACING_PROBE.get().copied().unwrap_or(false)
 }
 
 #[inline]
