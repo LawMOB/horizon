@@ -105,42 +105,17 @@ impl SeenGrid {
         let c = self.cell_of[i as usize];
         lo.0 <= c.0 && c.0 <= hi.0 && lo.1 <= c.1 && c.1 <= hi.1
     }
-    /// Borrow the candidates when `area` reaches only one grid cell.
-    ///
-    /// The cell slice is already sorted in snapshot order, so callers can iterate it without
-    /// allocating or copying a temporary candidate list. `None` retains the normal multi-cell or
-    /// full-scan path.
-    pub fn single_cell_candidates(&self, area: Aabb) -> Option<&[u32]> {
-        let ((lo_x, lo_z), (hi_x, hi_z)) = self.admission(area)?;
-        if lo_x != hi_x || lo_z != hi_z {
-            return None;
-        }
-        Some(self.cells.get(&(lo_x, lo_z)).map_or(&[], Vec::as_slice))
+    /// The ordered entries in one cell, used after query admission is checked.
+    pub(super) fn cell_candidates(&self, cell: (i32, i32)) -> &[u32] {
+        self.cells.get(&cell).map_or(&[], Vec::as_slice)
     }
-    /// The indices, ascending, of every entry whose box can meet `area`
-    /// (a superset: callers still test it). False when the area spans more
-    /// columns than the grid has entries (at least 64), or is not finite:
-    /// scan them all.
-    pub fn candidates(&self, area: Aabb, out: &mut Vec<u32>) -> bool {
+    /// Fill `out` for columns previously returned by [`Self::admission`].
+    pub(super) fn candidates_in_columns(
+        &self,
+        (lo, hi): ((i32, i32), (i32, i32)),
+        out: &mut Vec<u32>,
+    ) {
         out.clear();
-        // A box meets `area` only if its minimum corner is below area.max
-        // and within `reach` (plus a margin for rounding) of area.min.
-        let margin = self.reach + 1.0;
-        let min_x = area.min(Axis::X) - margin;
-        let min_z = area.min(Axis::Z) - margin;
-        let max_x = area.max(Axis::X);
-        let max_z = area.max(Axis::Z);
-        if !min_x.is_finite() || !min_z.is_finite() || !max_x.is_finite() || !max_z.is_finite() {
-            return false;
-        }
-        let lo = column(min_x, min_z);
-        let hi = column(max_x, max_z);
-        let span = |a: i32, b: i32| i64::from(b) - i64::from(a) + 1;
-        let (nx, nz) = (span(lo.0, hi.0), span(lo.1, hi.1));
-        let max_cells = (self.cell_of.len().max(self.entries) as i64).max(64);
-        if nx < 1 || nz < 1 || nx.saturating_mul(nz) > max_cells {
-            return false;
-        }
         let mut slices = [&[][..]; 16];
         let mut num_slices = 0;
         let mut overflow = false;
@@ -164,9 +139,18 @@ impl SeenGrid {
                 out.extend_from_slice(s);
             }
             out.sort_unstable();
-            return true;
+        } else {
+            merge_slices(&slices[..num_slices], out);
         }
-        merge_slices(&slices[..num_slices], out);
+    }
+    /// Fill `out` with the ascending indices whose boxes can meet `area` (a superset).
+    /// Returns false when the caller should scan all entries instead.
+    pub fn candidates(&self, area: Aabb, out: &mut Vec<u32>) -> bool {
+        let Some(columns) = self.admission(area) else {
+            out.clear();
+            return false;
+        };
+        self.candidates_in_columns(columns, out);
         true
     }
 }
@@ -357,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn single_cell_candidates_borrow_the_ordered_cell_slice() {
+    fn single_cell_cell_slice_matches_query_candidate_order() {
         let boxes = vec![
             boxed(10.2, 64.0, 10.2, 0.6),
             boxed(10.8, 64.0, 10.8, 0.6),
@@ -367,16 +351,16 @@ mod tests {
         let one_cell = Aabb::new(Vec3::new(10.1, 64.0, 10.1), Vec3::new(11.5, 66.0, 11.5));
         let mut owned = Vec::new();
         assert!(grid.candidates(one_cell, &mut owned));
-        assert_eq!(
-            grid.single_cell_candidates(one_cell).map(|ids| ids.to_vec()),
-            Some(owned)
-        );
-
-        let multiple_cells = Aabb::new(
-            Vec3::new(10.1, 64.0, 10.1),
-            Vec3::new(14.5, 66.0, 14.5),
-        );
-        assert!(grid.single_cell_candidates(multiple_cells).is_none());
+        let ((lo_x, lo_z), (hi_x, hi_z)) = grid.admission(one_cell).unwrap();
+        assert_eq!((lo_x, lo_z), (hi_x, hi_z));
+        assert_eq!(grid.cell_candidates((lo_x, lo_z)), owned.as_slice());
+        let ((lo_x, lo_z), (hi_x, hi_z)) = grid
+            .admission(Aabb::new(
+                Vec3::new(10.1, 64.0, 10.1),
+                Vec3::new(14.5, 66.0, 14.5),
+            ))
+            .unwrap();
+        assert!((lo_x, lo_z) != (hi_x, hi_z));
     }
 
     #[test]
@@ -432,7 +416,6 @@ mod tests {
             rounds * n
         );
     }
-
     /// A grid of part of a list's boxes that answers as the whole list's grid decides when to scan
     /// every entry and when to look in columns: the part meets its boxes as the whole would.
     #[test]
