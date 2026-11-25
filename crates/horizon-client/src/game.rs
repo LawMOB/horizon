@@ -11178,6 +11178,9 @@ pub(crate) fn run_with(
     native: horizon_mod_package::runtime::Runtime,
 ) -> Result<()> {
     let mut options = Options::read(options)?;
+    if options.is_client_start() {
+        horizon_client::frame_spikes::init(&horizon_client::logging::player_dir());
+    }
     options.mods.native = Arc::new(native);
     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
         && !dedicated::preflight(&mut options)?
