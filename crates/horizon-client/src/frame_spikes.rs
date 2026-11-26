@@ -1,5 +1,5 @@
-//! Spike-triggered frame diagnostics. Normal frames update fixed-size samples only;
-//! formatting and filesystem access happen below the spike gate.
+//! Opt-in frame-pacing diagnostics. Normal frames use bounded in-memory samples; completed windows are written by a worker.
+//! No frame-loop pacing or graphics settings are changed here.
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -24,7 +24,6 @@ const BURST_LIMIT: u64 = 2 << 20;
 const BURST_TRIGGER_MS: f64 = 1_000.0 / 58.0;
 const BURST_PRE_FRAMES: usize = 30;
 const BURST_POST_FRAMES: usize = 90;
-const BURST_COOLDOWN: Duration = Duration::from_secs(5);
 const SERVER_SAMPLE_MAX_AGE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Default)]
@@ -138,6 +137,8 @@ struct FramePacingRecord {
     current_wait_present_ms: f64,
     current_wait_present_call_ms: f64,
     current_wait_valid: bool,
+    process_resident_bytes: Option<u64>,
+    process_memory_sample_ms: f64,
     server_tick_ms: f64,
     mob_tick_ms: f64,
     collision_push_ms: f64,
@@ -172,11 +173,10 @@ struct ActiveBurst {
 struct BurstCapture {
     history: VecDeque<FramePacingRecord>,
     active: Option<ActiveBurst>,
-    last_trigger_ns: Option<u64>,
 }
 
 impl BurstCapture {
-    fn push(&mut self, record: FramePacingRecord, now_ns: u64) {
+    fn push(&mut self, record: FramePacingRecord) {
         let mut completed = None;
         if let Some(mut active) = self.active.take() {
             if record.frame_ms > BURST_TRIGGER_MS {
@@ -191,10 +191,7 @@ impl BurstCapture {
                 self.active = Some(active);
             }
         } else {
-            let cooled_down = self.last_trigger_ns.is_none_or(|last| {
-                now_ns.saturating_sub(last) >= duration_ns(BURST_COOLDOWN)
-            });
-            if record.resident_chunks > 0 && record.frame_ms > BURST_TRIGGER_MS && cooled_down {
+            if record.resident_chunks > 0 && record.frame_ms > BURST_TRIGGER_MS {
                 let mut records = Vec::with_capacity(
                     BURST_PRE_FRAMES + 1 + BURST_POST_FRAMES,
                 );
@@ -209,7 +206,6 @@ impl BurstCapture {
                     },
                     frames_remaining: BURST_POST_FRAMES,
                 });
-                self.last_trigger_ns = Some(now_ns);
             }
         }
 
@@ -295,7 +291,7 @@ pub fn init(config_dir: &Path) {
             "default"
         };
         let line = format!(
-            "Horizon frame pacing trace schema=4 enabled={enabled} source={source} env_enabled={environment} config_enabled={configured} pid={}",
+            "Horizon frame pacing trace schema=5 enabled={enabled} source={source} env_enabled={environment} config_enabled={configured} pid={}",
             std::process::id(),
         );
         log::info!("{line}");
@@ -623,7 +619,7 @@ fn enqueue_burst(burst: FrameBurst) {
 
 fn write_burst(path: &Path, burst: &FrameBurst) -> std::io::Result<()> {
     let mut output = format!(
-        "Horizon frame pacing burst schema=1 trigger_frame_id={} trigger_count={} peak_interval_ms={:.2} frame_count={} pre_frames={} post_frames={}\n",
+        "Horizon frame pacing burst schema=2 trigger_frame_id={} trigger_count={} peak_interval_ms={:.2} frame_count={} pre_frames={} post_frames={}\n",
         burst.trigger_frame_id,
         burst.trigger_count,
         burst.peak_frame_ms,
@@ -633,7 +629,7 @@ fn write_burst(path: &Path, burst: &FrameBurst) -> std::io::Result<()> {
     );
     for record in &burst.records {
         output.push_str(&format!(
-            "Horizon frame pacing sample frame_id={} interval_from_frame_id={} frame_start_monotonic_ns={} frame_ms={:.2} previous_work_ms={:.2} previous_render_wait_ms={:.2} prior_wait_land_ms={:.2} prior_wait_queue_before_acquire_ms={:.2} prior_wait_acquire_ms={:.2} prior_wait_queue_before_present_ms={:.2} prior_wait_present_block_ms={:.2} prior_wait_present_call_ms={:.2} prior_wait_valid={} previous_frame_tail_ms={:.2} redraw_delivery_ms={:.2} request_to_callback_ms={:.2} callback_to_start_ms={:.2} redraw_request_count={} redraw_pairing_valid={} current_work_ms={:.2} client_tick_ms={:.2} current_render_cpu_ms={:.2} current_render_wait_ms={:.2} current_wait_land_ms={:.2} current_wait_queue_before_acquire_ms={:.2} current_wait_acquire_ms={:.2} current_wait_queue_before_present_ms={:.2} current_wait_present_block_ms={:.2} current_wait_present_call_ms={:.2} current_wait_valid={} server_tick_ms={:.2} mob_tick_ms={:.2} collision_push_ms={:.2} server_grid_ms={:.2} server_save_ms={:.2} server_sample_age_ms={:.1} chunk_upload_ms={:.2} terrain_upload_bytes={} entity_prep_ms={:.2} mob_geometry_ms={:.2} block_entity_ms={:.2} shadow_caster_ms={:.2} total_mobs={} nearby_mobs_32={} resident_chunks={} pending_uploads={}\n",
+            "Horizon frame pacing sample frame_id={} interval_from_frame_id={} frame_start_monotonic_ns={} frame_ms={:.2} previous_work_ms={:.2} previous_render_wait_ms={:.2} prior_wait_land_ms={:.2} prior_wait_queue_before_acquire_ms={:.2} prior_wait_acquire_ms={:.2} prior_wait_queue_before_present_ms={:.2} prior_wait_present_block_ms={:.2} prior_wait_present_call_ms={:.2} prior_wait_valid={} previous_frame_tail_ms={:.2} redraw_delivery_ms={:.2} request_to_callback_ms={:.2} callback_to_start_ms={:.2} redraw_request_count={} redraw_pairing_valid={} current_work_ms={:.2} client_tick_ms={:.2} current_render_cpu_ms={:.2} current_render_wait_ms={:.2} current_wait_land_ms={:.2} current_wait_queue_before_acquire_ms={:.2} current_wait_acquire_ms={:.2} current_wait_queue_before_present_ms={:.2} current_wait_present_block_ms={:.2} current_wait_present_call_ms={:.2} current_wait_valid={} process_memory_valid={} process_resident_bytes={} process_memory_sample_ms={:.3} server_tick_ms={:.2} mob_tick_ms={:.2} collision_push_ms={:.2} server_grid_ms={:.2} server_save_ms={:.2} server_sample_age_ms={:.1} chunk_upload_ms={:.2} terrain_upload_bytes={} entity_prep_ms={:.2} mob_geometry_ms={:.2} block_entity_ms={:.2} shadow_caster_ms={:.2} total_mobs={} nearby_mobs_32={} resident_chunks={} pending_uploads={}\n",
             record.frame_id,
             record.frame_id.saturating_sub(1),
             record.frame_start_ns,
@@ -664,6 +660,9 @@ fn write_burst(path: &Path, burst: &FrameBurst) -> std::io::Result<()> {
             record.current_wait_present_ms,
             record.current_wait_present_call_ms,
             record.current_wait_valid,
+            record.process_resident_bytes.is_some(),
+            record.process_resident_bytes.unwrap_or(0),
+            record.process_memory_sample_ms,
             record.server_tick_ms,
             record.mob_tick_ms,
             record.collision_push_ms,
@@ -719,6 +718,9 @@ fn capture_burst_frame(
     let callback = pacing.callback;
     let request = callback.and_then(|callback| callback.request);
     let wait = render_wait_trace.unwrap_or_default();
+    let memory_started = Instant::now();
+    let process_resident_bytes = horizon_threads::process_memory::resident_bytes();
+    let process_memory_sample_ms = ms(memory_started.elapsed());
     let previous_wait_valid = pacing.previous_wait_trace.is_some_and(|trace| trace.complete)
         && pacing.previous_finished_frame_id != 0
         && pacing.previous_finished_frame_id == pacing.frame_id.saturating_sub(1);
@@ -756,6 +758,8 @@ fn capture_burst_frame(
         current_wait_present_ms: ms(wait.present),
         current_wait_present_call_ms: wait.present_call.map_or(-1.0, ms),
         current_wait_valid: render_wait_trace.is_some_and(|trace| trace.complete),
+        process_resident_bytes,
+        process_memory_sample_ms,
         server_tick_ms: if fresh { server.total_ns as f64 / 1_000_000.0 } else { 0.0 },
         mob_tick_ms: if fresh { server.mobs_ns as f64 / 1_000_000.0 } else { 0.0 },
         collision_push_ms: if fresh {
@@ -777,7 +781,7 @@ fn capture_burst_frame(
         resident_chunks,
         pending_uploads,
     };
-    BURST_CAPTURE.with(|capture| capture.borrow_mut().push(record, clock_ns()));
+    BURST_CAPTURE.with(|capture| capture.borrow_mut().push(record));
 }
 
 /// Log slow frames only. The interval ends at this frame's start; work/render durations
