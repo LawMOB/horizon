@@ -77,6 +77,8 @@ pub(super) struct Loading {
     pub(super) title_drawn: bool,
     #[cfg(target_os = "ios")]
     pub(super) ime_allowed: bool,
+    #[cfg(target_os = "ios")]
+    pub(super) ios_frame_pacing: event_loop::IosFramePacing,
     pub(super) menu: startup_menu::StartupMenu,
     pub(super) error: Option<Box<dyn std::error::Error>>,
 }
@@ -108,6 +110,8 @@ impl Loading {
             || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT)
     }
     pub(super) fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
+        self.ios_frame_pacing.set_active(true);
         if self.window.is_some() {
             return;
         }
@@ -438,6 +442,7 @@ impl Loading {
         #[cfg(target_os = "ios")]
         {
             game.ime_allowed = self.ime_allowed;
+            game.ios_frame_pacing = std::mem::take(&mut self.ios_frame_pacing);
         }
         self.menu.handoff(&mut game);
         game.apply_settings();
@@ -465,6 +470,14 @@ pub(super) enum App {
     Ready(Box<split::Split<'static>>),
 }
 impl ApplicationHandler for App {
+    #[cfg(target_os = "ios")]
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            App::Loading(loading) => loading.ios_frame_pacing.set_active(false),
+            App::Ready(game) => game.suspended(event_loop),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match self {
             App::Loading(loading) => loading.resumed(event_loop),
@@ -472,6 +485,13 @@ impl ApplicationHandler for App {
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        #[cfg(target_os = "ios")]
+        if let App::Loading(loading) = self
+            && loading.window.as_ref().is_some_and(|w| w.id() == id)
+            && let WindowEvent::Occluded(occluded) = &event
+        {
+            loading.ios_frame_pacing.set_occluded(*occluded);
+        }
         // iOS sends touches and no mouse: while loading, the first finger is
         // the mouse; the game itself handles them once it is ready (touch.rs).
         #[cfg(target_os = "ios")]
@@ -632,7 +652,6 @@ pub(super) fn follow_window_size(window: Option<&Window>, renderer: Option<&mut 
                 size.height
             );
             renderer.resize(size.width, size.height);
-            horizon_client::frame_spikes::redraw_requested(window.id());
             window.request_redraw();
         }
     }
