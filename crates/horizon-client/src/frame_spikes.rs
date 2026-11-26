@@ -11,6 +11,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use horizon_client::gfx::RenderWaitTrace;
+use winit::window::WindowId;
 
 const FRAME_SPIKE_MS: f64 = 17.0;
 const LOG_INTERVAL: Duration = Duration::from_millis(500);
@@ -41,8 +43,29 @@ struct FramePacingSample {
     frame_start_ns: u64,
     previous_work: Duration,
     previous_render_wait: Duration,
+    previous_finished_frame_id: u64,
+    previous_wait_trace: Option<RenderWaitTrace>,
     previous_frame_tail: Duration,
     redraw_delivery: Option<Duration>,
+    request_to_callback: Option<Duration>,
+    callback_to_start: Option<Duration>,
+    callback: Option<RedrawCallback>,
+}
+
+#[derive(Clone, Copy)]
+struct RedrawRequest {
+    at_ns: u64,
+    from_frame_id: u64,
+    window: WindowId,
+    count: u32,
+    ambiguous: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RedrawCallback {
+    at_ns: u64,
+    request: Option<RedrawRequest>,
+    paired: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -50,7 +73,10 @@ struct FramePacingState {
     frame_id: u64,
     previous_work: Duration,
     previous_render_wait: Duration,
-    redraw_requested_at_ns: Option<u64>,
+    previous_finished_frame_id: u64,
+    previous_wait_trace: Option<RenderWaitTrace>,
+    request: Option<RedrawRequest>,
+    callback: Option<RedrawCallback>,
     tail_started_at_ns: Option<u64>,
     previous_frame_tail_ns: u64,
 }
@@ -102,7 +128,10 @@ thread_local! {
         frame_id: 0,
         previous_work: Duration::ZERO,
         previous_render_wait: Duration::ZERO,
-        redraw_requested_at_ns: None,
+        previous_finished_frame_id: 0,
+        previous_wait_trace: None,
+        request: None,
+        callback: None,
         tail_started_at_ns: None,
         previous_frame_tail_ns: 0,
     }) };
@@ -128,6 +157,7 @@ pub fn init(config_dir: &Path) {
         let environment = std::env::var("HORIZON_FRAME_PACING_TRACE")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
         let enabled = environment || configured;
+        horizon_client::gfx::set_frame_wait_trace(enabled);
         let source = if environment {
             "environment"
         } else if configured {
@@ -136,7 +166,7 @@ pub fn init(config_dir: &Path) {
             "default"
         };
         let line = format!(
-            "Horizon frame pacing trace schema=2 enabled={enabled} source={source} env_enabled={environment} config_enabled={configured} pid={}",
+            "Horizon frame pacing trace schema=3 enabled={enabled} source={source} env_enabled={environment} config_enabled={configured} pid={}",
             std::process::id(),
         );
         log::info!("{line}");
@@ -153,9 +183,11 @@ fn pacing_probe_enabled() -> bool {
 
 #[inline]
 fn clock_ns() -> u64 {
-    STARTED
-        .get_or_init(Instant::now)
-        .elapsed()
+    clock_at_ns(Instant::now())
+}
+
+fn clock_at_ns(at: Instant) -> u64 {
+    at.saturating_duration_since(*STARTED.get_or_init(|| at))
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64
 }
@@ -169,7 +201,7 @@ fn update_frame(update: impl FnOnce(&mut FrameSample)) {
 }
 
 /// Start a fixed-size frame sample on the render thread.
-pub fn begin() {
+pub fn begin(started: Instant) {
     FRAME.with(|sample| sample.set(FrameSample::default()));
     if !pacing_probe_enabled() {
         return;
@@ -177,17 +209,27 @@ pub fn begin() {
     let pacing = PACING.with(|cell| {
         let mut state = cell.get();
         state.frame_id = state.frame_id.saturating_add(1);
-        let now_ns = clock_ns();
+        let now_ns = clock_at_ns(started);
+        let callback = state.callback.take();
+        let paired = callback.filter(|c| c.paired);
+        let request = paired.and_then(|c| c.request);
         let sample = FramePacingSample {
             frame_id: state.frame_id,
             frame_start_ns: now_ns,
             previous_work: state.previous_work,
             previous_render_wait: state.previous_render_wait,
+            previous_finished_frame_id: state.previous_finished_frame_id,
+            previous_wait_trace: state.previous_wait_trace,
             previous_frame_tail: Duration::from_nanos(state.previous_frame_tail_ns),
-            redraw_delivery: state
-                .redraw_requested_at_ns
-                .take()
-                .map(|at| Duration::from_nanos(now_ns.saturating_sub(at))),
+            redraw_delivery: request
+                .map(|r| Duration::from_nanos(now_ns.saturating_sub(r.at_ns))),
+            request_to_callback: paired.and_then(|c| {
+                c.request
+                    .map(|r| Duration::from_nanos(c.at_ns.saturating_sub(r.at_ns)))
+            }),
+            callback_to_start: callback
+                .map(|c| Duration::from_nanos(now_ns.saturating_sub(c.at_ns))),
+            callback,
         };
         state.previous_frame_tail_ns = 0;
         cell.set(state);
@@ -197,20 +239,56 @@ pub fn begin() {
 }
 
 /// Record the first pending redraw request and the time spent in the frame-loop tail.
-pub fn redraw_requested() {
+pub fn redraw_requested(window: WindowId) {
     if !pacing_probe_enabled() {
         return;
     }
     PACING.with(|cell| {
         let mut state = cell.get();
-        if state.redraw_requested_at_ns.is_none() {
+        if let Some(request) = &mut state.request {
+            request.count = request.count.saturating_add(1);
+            request.ambiguous |=
+                request.window != window || request.from_frame_id != state.frame_id;
+        } else {
             let now_ns = clock_ns();
-            state.redraw_requested_at_ns = Some(now_ns);
+            state.request = Some(RedrawRequest {
+                at_ns: now_ns,
+                from_frame_id: state.frame_id,
+                window,
+                count: 1,
+                ambiguous: false,
+            });
             if let Some(started_at_ns) = state.tail_started_at_ns.take() {
                 state.previous_frame_tail_ns = now_ns.saturating_sub(started_at_ns);
             }
-            cell.set(state);
         }
+        cell.set(state);
+    });
+}
+
+/// Native callback entry, before event routing, device recovery, fullscreen and IME work.
+/// Consume requests here so a callback that skips `begin` cannot retain a stale pairing.
+pub fn redraw_callback(window: WindowId) {
+    if !pacing_probe_enabled() {
+        return;
+    }
+    let at_ns = clock_ns();
+    PACING.with(|cell| {
+        let mut state = cell.get();
+        let request = state.request.take();
+        let paired = state.callback.is_none()
+            && request.is_some_and(|r| {
+                !r.ambiguous
+                    && r.window == window
+                    && r.from_frame_id == state.frame_id
+                    && r.from_frame_id != 0
+            });
+        state.callback = Some(RedrawCallback {
+            at_ns,
+            request,
+            paired,
+        });
+        cell.set(state);
     });
 }
 
@@ -381,6 +459,7 @@ pub fn finish(
     frame_cpu: Duration,
     render_cpu: Duration,
     render_wait: Duration,
+    render_wait_trace: Option<RenderWaitTrace>,
     resident_chunks: usize,
     pending_uploads: usize,
 ) {
@@ -389,6 +468,8 @@ pub fn finish(
             let mut state = cell.get();
             state.previous_work = frame_cpu;
             state.previous_render_wait = render_wait;
+            state.previous_finished_frame_id = state.frame_id;
+            state.previous_wait_trace = render_wait_trace;
             state.tail_started_at_ns = Some(clock_ns());
             cell.set(state);
         });
@@ -443,8 +524,14 @@ pub fn finish(
         sample.shadow_caster_count,
     );
     let line = if let Some(pacing) = PACING_SAMPLE.with(Cell::get) {
+        let callback = pacing.callback;
+        let request = callback.and_then(|c| c.request);
+        let wait = pacing.previous_wait_trace.unwrap_or_default();
+        let wait_valid = pacing.previous_wait_trace.is_some_and(|w| w.complete)
+            && pacing.previous_finished_frame_id != 0
+            && pacing.previous_finished_frame_id == pacing.frame_id.saturating_sub(1);
         format!(
-            "{line} frame_id={} interval_from_frame_id={} frame_start_monotonic_ns={} prior_frame_work_ms={:.2} prior_render_wait_ms={:.2} prior_frame_tail_ms={:.2} redraw_delivery_ms={:.2}",
+            "{line} frame_id={} interval_from_frame_id={} frame_start_monotonic_ns={} prior_frame_work_ms={:.2} prior_render_wait_ms={:.2} prior_frame_tail_ms={:.2} redraw_delivery_ms={:.2} redraw_request_monotonic_ns={} redraw_request_from_frame_id={} redraw_request_count={} redraw_callback_monotonic_ns={} redraw_pairing_valid={} redraw_request_to_callback_ms={:.2} redraw_callback_to_start_ms={:.2} prior_render_wait_valid={} prior_wait_land_ms={:.2} prior_wait_queue_before_acquire_ms={:.2} prior_wait_acquire_ms={:.2} prior_wait_queue_before_present_ms={:.2} prior_wait_present_block_ms={:.2} prior_wait_surface={} prior_wait_frame_generation={} prior_wait_deferred_submit={} prior_wait_present_call_ms={:.2}",
             pacing.frame_id,
             pacing.frame_id.saturating_sub(1),
             pacing.frame_start_ns,
@@ -452,6 +539,23 @@ pub fn finish(
             ms(pacing.previous_render_wait),
             ms(pacing.previous_frame_tail),
             pacing.redraw_delivery.map_or(-1.0, ms),
+            request.map_or(0, |r| r.at_ns),
+            request.map_or(0, |r| r.from_frame_id),
+            request.map_or(0, |r| r.count),
+            callback.map_or(0, |c| c.at_ns),
+            callback.is_some_and(|c| c.paired),
+            pacing.request_to_callback.map_or(-1.0, ms),
+            pacing.callback_to_start.map_or(-1.0, ms),
+            wait_valid,
+            ms(wait.land),
+            ms(wait.queue_before_acquire),
+            ms(wait.acquire),
+            ms(wait.queue_before_present),
+            ms(wait.present),
+            wait.surface,
+            wait.frame_generation,
+            wait.deferred_submit,
+            wait.present_call.map_or(-1.0, ms),
         )
     } else {
         line
