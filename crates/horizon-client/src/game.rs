@@ -10170,7 +10170,7 @@ impl Game<'_> {
                     self.observe_fullscreen();
                     self.sync_ime();
                     let now = Instant::now();
-                    horizon_client::frame_spikes::begin();
+                    horizon_client::frame_spikes::begin(now);
                     horizon_threads::work::tick_start();
                     let elapsed = now.duration_since(self.previous);
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
@@ -10238,6 +10238,7 @@ impl Game<'_> {
                             cpu,
                             r.last_encode,
                             r.last_wait,
+                            r.last_wait_trace.take().filter(|_| rendered),
                             self.world.chunks.len(),
                             self.pending_uploads.len(),
                         );
