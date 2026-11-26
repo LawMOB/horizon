@@ -22,27 +22,8 @@ use std::{
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-static FRAME_WAIT_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Startup-only switch shared with the client's opt-in frame pacing trace.
-pub fn set_frame_wait_trace(enabled: bool) {
-    FRAME_WAIT_TRACE.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
 
-/// Wall durations already included in `last_wait`, not GPU execution times.
-#[derive(Clone, Copy, Default)]
-pub struct RenderWaitTrace {
-    pub land: Duration,
-    pub queue_before_acquire: Duration,
-    pub acquire: Duration,
-    pub queue_before_present: Duration,
-    pub present: Duration,
-    pub present_call: Option<Duration>,
-    pub complete: bool,
-    pub surface: bool,
-    pub frame_generation: bool,
-    pub deferred_submit: bool,
-}
 
 // RenderPipelines.CRUMBLING: dst * src + src * dst, alpha replaced.
 const CRUMBLING_BLEND: wgpu::BlendState = wgpu::BlendState {
@@ -1414,7 +1395,6 @@ pub struct Renderer {
     /// excluded from CPU time.
     pub last_wait: std::time::Duration,
     /// Consumed by the client once per frame; absent when tracing is disabled.
-    pub last_wait_trace: Option<RenderWaitTrace>,
     /// CPU time of the last `render`, waits excluded.
     pub last_encode: std::time::Duration,
     /// What this renderer's display last reported (`DisplayWatch`), its own: another
@@ -4416,7 +4396,6 @@ impl Renderer {
             gpu_times: Vec::new(),
             lightmap_pixels: [0; 16 * 16 * 4],
             last_wait: std::time::Duration::ZERO,
-            last_wait_trace: None,
             last_encode: std::time::Duration::ZERO,
             window,
             ray_scene: rt::scene::RayScene::forced(&device),
@@ -7182,7 +7161,6 @@ impl Renderer {
     }
     #[horizon_mod_api_macros::replaceable]
     pub fn render(&mut self, frame: &Frame) -> Result<bool> {
-        self.last_wait_trace = None;
         // A lost device cannot accept uploads either. Leave recovery to the
         // owner instead of submitting atlas patches to the invalid device.
         if self.device_lost() {
@@ -7329,15 +7307,9 @@ impl Renderer {
         // Its steps as spans (HORIZON_SPIKES): each lap names the step that just ended.
         let mut laps = crate::spans::laps();
         let started = Instant::now();
-        self.last_wait_trace = FRAME_WAIT_TRACE
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(RenderWaitTrace::default);
         self.land_frame();
         // Waiting for the previous frame (offscreen: at most two on the GPU), not work.
         let landed = started.elapsed();
-        if let Some(trace) = &mut self.last_wait_trace {
-            trace.land = landed;
-        }
         self.queue.take_waited();
         // World frames alone follow the shader pack: the game loads the picked one
         // before it draws one. Title frames draw no terrain and keep the layout
@@ -7470,12 +7442,6 @@ impl Renderer {
         };
         let acquired_in = acquire.elapsed();
         self.last_wait = landed + queued + acquired_in;
-        if let Some(trace) = &mut self.last_wait_trace {
-            trace.queue_before_acquire = queued;
-            trace.acquire = acquired_in;
-            trace.surface = self.surface.is_some();
-            trace.frame_generation = fg;
-        }
         // Inside the acquire's time already.
         self.queue.take_waited();
         let (surface_frame, reconfigure) = match acquired {
@@ -11254,11 +11220,6 @@ impl Renderer {
                     // The frame's waits for the previous one on the submit thread.
                     let queued = self.queue.take_waited();
                     self.last_wait += queued;
-                    if let Some(trace) = &mut self.last_wait_trace {
-                        trace.queue_before_present = queued;
-                        trace.deferred_submit = true;
-                        trace.complete = true;
-                    }
                     self.record_render_work(started);
                     self.visible = visible;
                     self.visible_lods = visible_lods;
@@ -11331,9 +11292,6 @@ impl Renderer {
         // The frame's own waits for the submit thread (its queue writes and passes).
         let queued = self.queue.take_waited();
         self.last_wait += queued;
-        if let Some(trace) = &mut self.last_wait_trace {
-            trace.queue_before_present = queued;
-        }
         let present = Instant::now();
         if let Some(surface_frame) = surface_frame {
             // On Wayland this ties RedrawRequested to the compositor's frame
@@ -11345,11 +11303,7 @@ impl Renderer {
             if first_frame {
                 startup_step(format_args!("presenting the first frame"));
             }
-            let present_call = self.last_wait_trace.as_ref().map(|_| Instant::now());
             self.queue.present(surface_frame);
-            if let Some(trace) = &mut self.last_wait_trace {
-                trace.present_call = present_call.map(|at| at.elapsed());
-            }
             if self.hdr.is_some()
                 && let Some(marker) = self.hdr_marker.take()
             {
@@ -11371,10 +11325,6 @@ impl Renderer {
         }
         let presented_in = present.elapsed();
         self.last_wait += presented_in;
-        if let Some(trace) = &mut self.last_wait_trace {
-            trace.present = presented_in;
-            trace.complete = true;
-        }
         // Inside the present's time already.
         self.queue.take_waited();
         self.record_render_work(started);
