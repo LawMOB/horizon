@@ -1,14 +1,17 @@
 //! Spike-triggered frame diagnostics. Normal frames update fixed-size samples only;
 //! formatting and filesystem access happen below the spike gate.
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    collections::VecDeque,
     fs::{self, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
+        mpsc::{self, SyncSender, TrySendError},
         OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 use horizon_client::gfx::RenderWaitTrace;
@@ -17,6 +20,11 @@ use winit::window::WindowId;
 const FRAME_SPIKE_MS: f64 = 17.0;
 const LOG_INTERVAL: Duration = Duration::from_millis(500);
 const LOG_LIMIT: u64 = 1 << 20;
+const BURST_LIMIT: u64 = 2 << 20;
+const BURST_TRIGGER_MS: f64 = 22.0;
+const BURST_PRE_FRAMES: usize = 30;
+const BURST_POST_FRAMES: usize = 90;
+const BURST_COOLDOWN: Duration = Duration::from_secs(5);
 const SERVER_SAMPLE_MAX_AGE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Default)]
@@ -99,6 +107,122 @@ struct ServerSnapshot {
     at_ns: u64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct FramePacingRecord {
+    frame_id: u64,
+    frame_start_ns: u64,
+    frame_ms: f64,
+    previous_work_ms: f64,
+    previous_render_wait_ms: f64,
+    previous_wait_land_ms: f64,
+    previous_wait_queue_before_acquire_ms: f64,
+    previous_wait_acquire_ms: f64,
+    previous_wait_queue_before_present_ms: f64,
+    previous_wait_present_ms: f64,
+    previous_wait_present_call_ms: f64,
+    previous_frame_tail_ms: f64,
+    redraw_delivery_ms: f64,
+    request_to_callback_ms: f64,
+    callback_to_start_ms: f64,
+    request_count: u32,
+    redraw_pairing_valid: bool,
+    previous_wait_valid: bool,
+    current_work_ms: f64,
+    current_client_tick_ms: f64,
+    current_render_cpu_ms: f64,
+    current_render_wait_ms: f64,
+    current_wait_land_ms: f64,
+    current_wait_queue_before_acquire_ms: f64,
+    current_wait_acquire_ms: f64,
+    current_wait_queue_before_present_ms: f64,
+    current_wait_present_ms: f64,
+    current_wait_present_call_ms: f64,
+    current_wait_valid: bool,
+    server_tick_ms: f64,
+    mob_tick_ms: f64,
+    collision_push_ms: f64,
+    server_grid_ms: f64,
+    server_save_ms: f64,
+    server_sample_age_ms: f64,
+    chunk_upload_ms: f64,
+    terrain_upload_bytes: u64,
+    entity_prep_ms: f64,
+    mob_geometry_ms: f64,
+    block_entity_ms: f64,
+    shadow_caster_ms: f64,
+    total_mobs: usize,
+    nearby_mobs: usize,
+    resident_chunks: usize,
+    pending_uploads: usize,
+}
+
+struct FrameBurst {
+    trigger_frame_id: u64,
+    trigger_count: u32,
+    peak_frame_ms: f64,
+    records: Vec<FramePacingRecord>,
+}
+
+struct ActiveBurst {
+    burst: FrameBurst,
+    frames_remaining: usize,
+}
+
+#[derive(Default)]
+struct BurstCapture {
+    history: VecDeque<FramePacingRecord>,
+    active: Option<ActiveBurst>,
+    last_trigger_ns: Option<u64>,
+}
+
+impl BurstCapture {
+    fn push(&mut self, record: FramePacingRecord, now_ns: u64) {
+        let mut completed = None;
+        if let Some(mut active) = self.active.take() {
+            if record.frame_ms >= BURST_TRIGGER_MS {
+                active.burst.trigger_count = active.burst.trigger_count.saturating_add(1);
+                active.burst.peak_frame_ms = active.burst.peak_frame_ms.max(record.frame_ms);
+            }
+            active.burst.records.push(record);
+            active.frames_remaining = active.frames_remaining.saturating_sub(1);
+            if active.frames_remaining == 0 {
+                completed = Some(active.burst);
+            } else {
+                self.active = Some(active);
+            }
+        } else {
+            let cooled_down = self.last_trigger_ns.is_none_or(|last| {
+                now_ns.saturating_sub(last) >= duration_ns(BURST_COOLDOWN)
+            });
+            if record.resident_chunks > 0 && record.frame_ms >= BURST_TRIGGER_MS && cooled_down {
+                let mut records = Vec::with_capacity(
+                    BURST_PRE_FRAMES + 1 + BURST_POST_FRAMES,
+                );
+                records.extend(self.history.iter().copied());
+                records.push(record);
+                self.active = Some(ActiveBurst {
+                    burst: FrameBurst {
+                        trigger_frame_id: record.frame_id,
+                        trigger_count: 1,
+                        peak_frame_ms: record.frame_ms,
+                        records,
+                    },
+                    frames_remaining: BURST_POST_FRAMES,
+                });
+                self.last_trigger_ns = Some(now_ns);
+            }
+        }
+
+        self.history.push_back(record);
+        while self.history.len() > BURST_PRE_FRAMES {
+            self.history.pop_front();
+        }
+        if let Some(burst) = completed {
+            enqueue_burst(burst);
+        }
+    }
+}
+
 thread_local! {
     static FRAME: Cell<FrameSample> = const { Cell::new(FrameSample {
         client_tick: Duration::ZERO,
@@ -135,6 +259,7 @@ thread_local! {
         tail_started_at_ns: None,
         previous_frame_tail_ns: 0,
     }) };
+    static BURST_CAPTURE: RefCell<BurstCapture> = RefCell::new(BurstCapture::default());
 }
 
 static SERVER_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -146,6 +271,7 @@ static SERVER_SAVE_NS: AtomicU64 = AtomicU64::new(0);
 static SERVER_AT_NS: AtomicU64 = AtomicU64::new(0);
 static STARTED: OnceLock<Instant> = OnceLock::new();
 static PACING_PROBE: OnceLock<bool> = OnceLock::new();
+static BURST_WRITER: OnceLock<SyncSender<FrameBurst>> = OnceLock::new();
 
 /// Called once after launch has selected the player folder and initialized logging.
 /// Both switches are opt-in; reading the file and writing the session marker happen at startup.
@@ -157,6 +283,9 @@ pub fn init(config_dir: &Path) {
         let environment = std::env::var("HORIZON_FRAME_PACING_TRACE")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
         let enabled = environment || configured;
+        if enabled {
+            start_burst_writer();
+        }
         horizon_client::gfx::set_frame_wait_trace(enabled);
         let source = if environment {
             "environment"
@@ -166,7 +295,7 @@ pub fn init(config_dir: &Path) {
             "default"
         };
         let line = format!(
-            "Horizon frame pacing trace schema=3 enabled={enabled} source={source} env_enabled={environment} config_enabled={configured} pid={}",
+            "Horizon frame pacing trace schema=4 enabled={enabled} source={source} env_enabled={environment} config_enabled={configured} pid={}",
             std::process::id(),
         );
         log::info!("{line}");
@@ -452,6 +581,205 @@ fn append_line(line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn start_burst_writer() {
+    if BURST_WRITER.get().is_some() {
+        return;
+    }
+    let (sender, receiver) = mpsc::sync_channel::<FrameBurst>(1);
+    let path = horizon_client::logging::player_dir()
+        .join("logs")
+        .join("frame_pacing_bursts.log");
+    match thread::Builder::new()
+        .name("Frame pacing trace writer".into())
+        .spawn(move || {
+            while let Ok(burst) = receiver.recv() {
+                if let Err(error) = write_burst(&path, &burst) {
+                    log::warn!("Horizon: couldn't write frame pacing burst: {error}");
+                }
+            }
+        })
+    {
+        Ok(_) => {
+            let _ = BURST_WRITER.set(sender);
+        }
+        Err(error) => log::warn!("Horizon: couldn't start frame pacing trace writer: {error}"),
+    }
+}
+
+fn enqueue_burst(burst: FrameBurst) {
+    let Some(writer) = BURST_WRITER.get() else {
+        return;
+    };
+    match writer.try_send(burst) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            log::warn!("Horizon: frame pacing burst dropped because the trace writer is busy");
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            log::warn!("Horizon: frame pacing burst dropped because the trace writer stopped");
+        }
+    }
+}
+
+fn write_burst(path: &Path, burst: &FrameBurst) -> std::io::Result<()> {
+    let mut output = format!(
+        "Horizon frame pacing burst schema=1 trigger_frame_id={} trigger_count={} peak_interval_ms={:.2} frame_count={} pre_frames={} post_frames={}\n",
+        burst.trigger_frame_id,
+        burst.trigger_count,
+        burst.peak_frame_ms,
+        burst.records.len(),
+        BURST_PRE_FRAMES,
+        BURST_POST_FRAMES,
+    );
+    for record in &burst.records {
+        output.push_str(&format!(
+            "Horizon frame pacing sample frame_id={} interval_from_frame_id={} frame_start_monotonic_ns={} frame_ms={:.2} previous_work_ms={:.2} previous_render_wait_ms={:.2} prior_wait_land_ms={:.2} prior_wait_queue_before_acquire_ms={:.2} prior_wait_acquire_ms={:.2} prior_wait_queue_before_present_ms={:.2} prior_wait_present_block_ms={:.2} prior_wait_present_call_ms={:.2} prior_wait_valid={} previous_frame_tail_ms={:.2} redraw_delivery_ms={:.2} request_to_callback_ms={:.2} callback_to_start_ms={:.2} redraw_request_count={} redraw_pairing_valid={} current_work_ms={:.2} client_tick_ms={:.2} current_render_cpu_ms={:.2} current_render_wait_ms={:.2} current_wait_land_ms={:.2} current_wait_queue_before_acquire_ms={:.2} current_wait_acquire_ms={:.2} current_wait_queue_before_present_ms={:.2} current_wait_present_block_ms={:.2} current_wait_present_call_ms={:.2} current_wait_valid={} server_tick_ms={:.2} mob_tick_ms={:.2} collision_push_ms={:.2} server_grid_ms={:.2} server_save_ms={:.2} server_sample_age_ms={:.1} chunk_upload_ms={:.2} terrain_upload_bytes={} entity_prep_ms={:.2} mob_geometry_ms={:.2} block_entity_ms={:.2} shadow_caster_ms={:.2} total_mobs={} nearby_mobs_32={} resident_chunks={} pending_uploads={}\n",
+            record.frame_id,
+            record.frame_id.saturating_sub(1),
+            record.frame_start_ns,
+            record.frame_ms,
+            record.previous_work_ms,
+            record.previous_render_wait_ms,
+            record.previous_wait_land_ms,
+            record.previous_wait_queue_before_acquire_ms,
+            record.previous_wait_acquire_ms,
+            record.previous_wait_queue_before_present_ms,
+            record.previous_wait_present_ms,
+            record.previous_wait_present_call_ms,
+            record.previous_wait_valid,
+            record.previous_frame_tail_ms,
+            record.redraw_delivery_ms,
+            record.request_to_callback_ms,
+            record.callback_to_start_ms,
+            record.request_count,
+            record.redraw_pairing_valid,
+            record.current_work_ms,
+            record.current_client_tick_ms,
+            record.current_render_cpu_ms,
+            record.current_render_wait_ms,
+            record.current_wait_land_ms,
+            record.current_wait_queue_before_acquire_ms,
+            record.current_wait_acquire_ms,
+            record.current_wait_queue_before_present_ms,
+            record.current_wait_present_ms,
+            record.current_wait_present_call_ms,
+            record.current_wait_valid,
+            record.server_tick_ms,
+            record.mob_tick_ms,
+            record.collision_push_ms,
+            record.server_grid_ms,
+            record.server_save_ms,
+            record.server_sample_age_ms,
+            record.chunk_upload_ms,
+            record.terrain_upload_bytes,
+            record.entity_prep_ms,
+            record.mob_geometry_ms,
+            record.block_entity_ms,
+            record.shadow_caster_ms,
+            record.total_mobs,
+            record.nearby_mobs,
+            record.resident_chunks,
+            record.pending_uploads,
+        ));
+    }
+    output.push_str(&format!(
+        "Horizon frame pacing burst end trigger_frame_id={}\n",
+        burst.trigger_frame_id,
+    ));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if file
+        .metadata()?
+        .len()
+        .saturating_add(output.len() as u64)
+        > BURST_LIMIT
+    {
+        file.set_len(0)?;
+    }
+    file.write_all(output.as_bytes())
+}
+fn capture_burst_frame(
+    frame_time: Duration,
+    frame_cpu: Duration,
+    render_cpu: Duration,
+    render_wait: Duration,
+    render_wait_trace: Option<RenderWaitTrace>,
+    resident_chunks: usize,
+    pending_uploads: usize,
+) {
+    let Some(pacing) = PACING_SAMPLE.with(Cell::get) else {
+        return;
+    };
+    let frame = FRAME.with(Cell::get);
+    let server = server_snapshot();
+    let age_ns = clock_ns().saturating_sub(server.at_ns);
+    let fresh = server.at_ns != 0 && age_ns <= duration_ns(SERVER_SAMPLE_MAX_AGE);
+    let callback = pacing.callback;
+    let request = callback.and_then(|callback| callback.request);
+    let wait = render_wait_trace.unwrap_or_default();
+    let previous_wait_valid = pacing.previous_wait_trace.is_some_and(|trace| trace.complete)
+        && pacing.previous_finished_frame_id != 0
+        && pacing.previous_finished_frame_id == pacing.frame_id.saturating_sub(1);
+    let record = FramePacingRecord {
+        frame_id: pacing.frame_id,
+        frame_start_ns: pacing.frame_start_ns,
+        frame_ms: ms(frame_time),
+        previous_work_ms: ms(pacing.previous_work),
+        previous_render_wait_ms: ms(pacing.previous_render_wait),
+        previous_wait_land_ms: pacing.previous_wait_trace.map_or(0.0, |trace| ms(trace.land)),
+        previous_wait_queue_before_acquire_ms: pacing.previous_wait_trace
+            .map_or(0.0, |trace| ms(trace.queue_before_acquire)),
+        previous_wait_acquire_ms: pacing.previous_wait_trace.map_or(0.0, |trace| ms(trace.acquire)),
+        previous_wait_queue_before_present_ms: pacing.previous_wait_trace
+            .map_or(0.0, |trace| ms(trace.queue_before_present)),
+        previous_wait_present_ms: pacing.previous_wait_trace.map_or(0.0, |trace| ms(trace.present)),
+        previous_wait_present_call_ms: pacing.previous_wait_trace
+            .and_then(|trace| trace.present_call)
+            .map_or(-1.0, ms),
+        previous_frame_tail_ms: ms(pacing.previous_frame_tail),
+        redraw_delivery_ms: pacing.redraw_delivery.map_or(-1.0, ms),
+        request_to_callback_ms: pacing.request_to_callback.map_or(-1.0, ms),
+        callback_to_start_ms: pacing.callback_to_start.map_or(-1.0, ms),
+        request_count: request.map_or(0, |request| request.count),
+        redraw_pairing_valid: callback.is_some_and(|callback| callback.paired),
+        previous_wait_valid,
+        current_work_ms: ms(frame_cpu),
+        current_client_tick_ms: ms(frame.client_tick),
+        current_render_cpu_ms: ms(render_cpu),
+        current_render_wait_ms: ms(render_wait),
+        current_wait_land_ms: ms(wait.land),
+        current_wait_queue_before_acquire_ms: ms(wait.queue_before_acquire),
+        current_wait_acquire_ms: ms(wait.acquire),
+        current_wait_queue_before_present_ms: ms(wait.queue_before_present),
+        current_wait_present_ms: ms(wait.present),
+        current_wait_present_call_ms: wait.present_call.map_or(-1.0, ms),
+        current_wait_valid: render_wait_trace.is_some_and(|trace| trace.complete),
+        server_tick_ms: if fresh { server.total_ns as f64 / 1_000_000.0 } else { 0.0 },
+        mob_tick_ms: if fresh { server.mobs_ns as f64 / 1_000_000.0 } else { 0.0 },
+        collision_push_ms: if fresh {
+            server.collision_push_ns as f64 / 1_000_000.0
+        } else {
+            0.0
+        },
+        server_grid_ms: if fresh { server.grid_ns as f64 / 1_000_000.0 } else { 0.0 },
+        server_save_ms: if fresh { server.save_ns as f64 / 1_000_000.0 } else { 0.0 },
+        server_sample_age_ms: if fresh { age_ns as f64 / 1_000_000.0 } else { 0.0 },
+        chunk_upload_ms: ms(frame.chunk_upload),
+        terrain_upload_bytes: frame.terrain_upload_bytes,
+        entity_prep_ms: ms(frame.entity_prep),
+        mob_geometry_ms: ms(frame.mob_geometry),
+        block_entity_ms: ms(frame.block_entities),
+        shadow_caster_ms: ms(frame.shadow_casters),
+        total_mobs: frame.mob_count,
+        nearby_mobs: frame.nearby_mobs,
+        resident_chunks,
+        pending_uploads,
+    };
+    BURST_CAPTURE.with(|capture| capture.borrow_mut().push(record, clock_ns()));
+}
+
 /// Log slow frames only. The interval ends at this frame's start; work/render durations
 /// describe the current callback. Work is wall time minus known renderer waits, not CPU usage.
 pub fn finish(
@@ -473,6 +801,17 @@ pub fn finish(
             state.tail_started_at_ns = Some(clock_ns());
             cell.set(state);
         });
+    }
+    if pacing_probe_enabled() {
+        capture_burst_frame(
+            frame_time,
+            frame_cpu,
+            render_cpu,
+            render_wait,
+            render_wait_trace,
+            resident_chunks,
+            pending_uploads,
+        );
     }
     if ms(frame_time) < FRAME_SPIKE_MS || !permit_log(Instant::now()) {
         return;
