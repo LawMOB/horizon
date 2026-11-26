@@ -21,7 +21,7 @@ const FRAME_SPIKE_MS: f64 = 17.0;
 const LOG_INTERVAL: Duration = Duration::from_millis(500);
 const LOG_LIMIT: u64 = 1 << 20;
 const BURST_LIMIT: u64 = 2 << 20;
-const BURST_TRIGGER_MS: f64 = 22.0;
+const BURST_TRIGGER_MS: f64 = 1_000.0 / 58.0;
 const BURST_PRE_FRAMES: usize = 30;
 const BURST_POST_FRAMES: usize = 90;
 const BURST_COOLDOWN: Duration = Duration::from_secs(5);
@@ -179,7 +179,7 @@ impl BurstCapture {
     fn push(&mut self, record: FramePacingRecord, now_ns: u64) {
         let mut completed = None;
         if let Some(mut active) = self.active.take() {
-            if record.frame_ms >= BURST_TRIGGER_MS {
+            if record.frame_ms > BURST_TRIGGER_MS {
                 active.burst.trigger_count = active.burst.trigger_count.saturating_add(1);
                 active.burst.peak_frame_ms = active.burst.peak_frame_ms.max(record.frame_ms);
             }
@@ -194,7 +194,7 @@ impl BurstCapture {
             let cooled_down = self.last_trigger_ns.is_none_or(|last| {
                 now_ns.saturating_sub(last) >= duration_ns(BURST_COOLDOWN)
             });
-            if record.resident_chunks > 0 && record.frame_ms >= BURST_TRIGGER_MS && cooled_down {
+            if record.resident_chunks > 0 && record.frame_ms > BURST_TRIGGER_MS && cooled_down {
                 let mut records = Vec::with_capacity(
                     BURST_PRE_FRAMES + 1 + BURST_POST_FRAMES,
                 );
