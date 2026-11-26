@@ -297,6 +297,7 @@ impl Game<'_> {
                 Ok(true) => event_loop.exit(),
                 Ok(false) => {
                     if let Some(window) = &self.window {
+                        horizon_client::frame_spikes::redraw_requested(window.id());
                         window.request_redraw();
                     }
                     // Yield between polls even when disk I/O is slow.
@@ -360,7 +361,7 @@ impl Game<'_> {
                     input_trace::InputOrigin::Game,
                 );
             } else {
-                horizon_client::frame_spikes::redraw_requested();
+                horizon_client::frame_spikes::redraw_requested(w.id());
                 w.request_redraw();
             }
         } else if self.options.headless {
@@ -446,6 +447,11 @@ impl ApplicationHandler for Game<'_> {
         self.previous = Instant::now();
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if matches!(&event, WindowEvent::RedrawRequested)
+            && self.window.as_ref().is_some_and(|w| w.id() == id)
+        {
+            horizon_client::frame_spikes::redraw_callback(id);
+        }
         #[cfg(target_os = "ios")]
         if let WindowEvent::Touch(touch) = event {
             if self.window.as_ref().is_none_or(|w| w.id() != id) || self.scripted_run() {
