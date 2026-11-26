@@ -11,6 +11,19 @@ pub(super) enum ClientQuit {
 }
 
 impl Game<'_> {
+    #[cfg(target_os = "ios")]
+    pub(super) fn uses_ios_frame_pacing(&self) -> bool {
+        self.window.is_some()
+            && !self.options.offscreen
+            && !self.options.headless
+            && !self.options.paced_by_split
+            && !self.options.split_guest
+            && !self.split_window
+            && self.pending_save.is_none()
+            && self.options.frames.is_none()
+            && !self.scripted_run()
+    }
+
     /// Record the request without saving or entering other mod hooks from this hook.
     pub(super) fn request_client_quit(&self) -> bool {
         if !self.options.is_client_start()
@@ -297,7 +310,6 @@ impl Game<'_> {
                 Ok(true) => event_loop.exit(),
                 Ok(false) => {
                     if let Some(window) = &self.window {
-                        horizon_client::frame_spikes::redraw_requested(window.id());
                         window.request_redraw();
                     }
                     // Yield between polls even when disk I/O is slow.
@@ -349,6 +361,26 @@ impl Game<'_> {
             event_loop.exit();
             return;
         }
+        #[cfg(target_os = "ios")]
+        if self.uses_ios_frame_pacing() {
+            let limit = self.framerate_limit();
+            let flow = self.ios_frame_pacing.flow(self.previous, limit, Instant::now());
+            if flow == ControlFlow::Poll {
+                let id = self.window.as_ref().expect("the paced window exists").id();
+                self.frame_drawn = false;
+                self.handle_window_event(
+                    event_loop,
+                    id,
+                    WindowEvent::RedrawRequested,
+                    input_trace::InputOrigin::Game,
+                );
+                self.ios_frame_pacing.drawn(self.frame_drawn, Instant::now());
+            }
+            event_loop.set_control_flow(
+                self.ios_frame_pacing.flow(self.previous, limit, Instant::now()),
+            );
+            return;
+        }
         if let Some(w) = &self.window {
             if self.options.offscreen {
                 // Offscreen frames don't wait for the window to be drawn: an
@@ -361,7 +393,6 @@ impl Game<'_> {
                     input_trace::InputOrigin::Game,
                 );
             } else {
-                horizon_client::frame_spikes::redraw_requested(w.id());
                 w.request_redraw();
             }
         } else if self.options.headless {
@@ -386,6 +417,8 @@ impl Game<'_> {
 
 impl ApplicationHandler for Game<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
+        self.ios_frame_pacing.set_active(true);
         if self.window.is_some() {
             return;
         }
@@ -447,10 +480,14 @@ impl ApplicationHandler for Game<'_> {
         self.previous = Instant::now();
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if matches!(&event, WindowEvent::RedrawRequested)
-            && self.window.as_ref().is_some_and(|w| w.id() == id)
-        {
-            horizon_client::frame_spikes::redraw_callback(id);
+        #[cfg(target_os = "ios")]
+        if self.window.as_ref().is_some_and(|w| w.id() == id) {
+            if let WindowEvent::Occluded(occluded) = &event {
+                self.ios_frame_pacing.set_occluded(*occluded);
+            }
+            if matches!(&event, WindowEvent::RedrawRequested) && self.uses_ios_frame_pacing() {
+                return;
+            }
         }
         #[cfg(target_os = "ios")]
         if let WindowEvent::Touch(touch) = event {
@@ -537,6 +574,10 @@ impl ApplicationHandler for Game<'_> {
         // device, an occluded window) must still end after a server crash.
         self.exit_after_server_crash();
         self.idle(event_loop);
+    }
+    #[cfg(target_os = "ios")]
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.ios_frame_pacing.set_active(false);
     }
     /// The application is ending. On macOS, Quit (Cmd+Q) ends it through
     /// applicationWillTerminate without a CloseRequested; vanilla's GLFW
