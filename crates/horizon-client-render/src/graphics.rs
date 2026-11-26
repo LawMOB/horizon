@@ -887,7 +887,6 @@ pub struct Graphics {
     pub present_mode: PresentMode,
     pub pacing: Pacing,
     /// Optional frame pacing diagnostics, read once at startup; no rendering behavior changes.
-    pub frame_pacing_trace: bool,
     /// Chunk worker threads; 0 uses every core but one. Applies at the next start.
     pub workers: u32,
     /// Parallel Tick (Performance graphics, beside Worker Threads): applies from the next tick,
@@ -998,7 +997,6 @@ impl Default for Graphics {
             dither_cutout_mips: false,
             present_mode: PresentMode::Auto,
             pacing: Pacing::Efficient,
-            frame_pacing_trace: false,
             workers: 0,
             parallel_tick: ParallelTickMode::Off,
             overlay: Overlay::Off,
@@ -1168,7 +1166,6 @@ impl Graphics {
                         Pacing::Efficient
                     }
                 }
-                "framePacingTrace" => g.frame_pacing_trace = flag(g.frame_pacing_trace),
                 "workers" => g.workers = number(g.workers).min(64),
                 "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(50, 200),
                 "dynamicResolution" => g.dynamic_resolution = flag(g.dynamic_resolution),
@@ -1302,7 +1299,6 @@ impl Graphics {
             text += &format!("hdrFailedStart:{driver}\n");
         }
         text += &format!("msaa4x:{}\n", bool_text(self.msaa4x));
-        text += &format!("framePacingTrace:{}\n", bool_text(self.frame_pacing_trace));
         text += &self.blue_map.serialize();
         text
     }
@@ -1667,7 +1663,6 @@ mod tests {
             dither_cutout_mips: true,
             present_mode: PresentMode::Mailbox,
             pacing: Pacing::Precise,
-            frame_pacing_trace: true,
             workers: 6,
             parallel_tick: ParallelTickMode::Auto,
             overlay: Overlay::Graph,
