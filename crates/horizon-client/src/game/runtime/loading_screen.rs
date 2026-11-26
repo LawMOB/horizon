@@ -632,6 +632,7 @@ pub(super) fn follow_window_size(window: Option<&Window>, renderer: Option<&mut 
                 size.height
             );
             renderer.resize(size.width, size.height);
+            horizon_client::frame_spikes::redraw_requested(window.id());
             window.request_redraw();
         }
     }
