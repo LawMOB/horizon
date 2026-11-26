@@ -676,10 +676,8 @@ impl MobWorld<'_> {
     /// in snapshot order: through the grid when there is one, else all.
     pub fn others_near(&self, area: Aabb) -> NearIter<'_> {
         if let Some(grid) = self.others_grid {
-            let grid_started = std::time::Instant::now();
             if let Some((lo, hi)) = grid.admission(area) {
                 if lo == hi {
-                    crate::frame_spikes::server_grid(grid_started.elapsed());
                     return NearIter {
                         others: self.others,
                         indices: None,
@@ -695,7 +693,6 @@ impl MobWorld<'_> {
                         .unwrap_or_default()
                 });
                 grid.candidates_in_columns((lo, hi), &mut buf);
-                crate::frame_spikes::server_grid(grid_started.elapsed());
                 return NearIter {
                     others: self.others,
                     indices: Some(buf),
@@ -704,7 +701,6 @@ impl MobWorld<'_> {
                     fallback: None,
                 };
             }
-            crate::frame_spikes::server_grid(grid_started.elapsed());
         }
         NearIter {
             others: self.others,
