@@ -1630,6 +1630,8 @@ mod tests {
             title_drawn: false,
             #[cfg(target_os = "ios")]
             ime_allowed: false,
+            #[cfg(target_os = "ios")]
+            ios_frame_pacing: Default::default(),
             menu: StartupMenu::default(),
             error: None,
         }
