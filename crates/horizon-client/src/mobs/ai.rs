@@ -2486,10 +2486,8 @@ fn push_entities(
     level: &mut DamageLevel<'_>,
     events: &mut Vec<MobEvent>,
 ) {
-    let started = std::time::Instant::now();
     m.on_climbable = on_climbable(m, w);
     if m.species() == Species::Bat {
-        crate::frame_spikes::server_collision_push(started.elapsed());
         return;
     }
     let bounds = m.bounds();
@@ -2593,7 +2591,6 @@ fn push_entities(
         cap.record(m, who);
     }
     super::world::give_push_targets(targets);
-    crate::frame_spikes::server_collision_push(started.elapsed());
 }
 /// `Mob.aiStep` -> `Mob.burnUndead`: undead burn in daylight. It runs with
 /// or without AI (`NoAI` only skips `serverAiStep`).
