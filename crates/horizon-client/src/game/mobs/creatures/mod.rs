@@ -7896,7 +7896,6 @@ impl Game<'_> {
         // Who watches (`Entity.isInvisibleTo`): the local player's team.
         let viewer = self.player_team();
         self.rendered_mobs.set(0);
-        let mut nearby_mobs = 0usize;
         let (skinning, listened) = (self.skinning(), self.mob_render_listened());
         // What custom entity model animations read of the frame.
         horizon_client::mobs::cem_anim::set_frame(horizon_client::mobs::cem_anim::Frame {
@@ -7932,9 +7931,6 @@ impl Game<'_> {
             let edge = (w + h + w) / 3.0 * if is_player { 10.0 } else { 1.0 };
             let range = edge * 64.0 * scale;
             let distance_squared = d.length_squared();
-            if distance_squared <= 32.0 * 32.0 {
-                nearby_mobs += 1;
-            }
             if distance_squared >= range * range {
                 continue;
             }
@@ -8236,16 +8232,6 @@ impl Game<'_> {
             (a, at)
         });
         self.projectile_geometry(camera, alpha, live, out);
-        horizon_client::frame_spikes::mob_counts(
-            self.mobs.len(),
-            nearby_mobs,
-            self.rendered_mobs.get(),
-            self.mobs.len()
-                + self.dropped.len()
-                + self.orbs.len()
-                + self.creatures.projectiles.len()
-                + self.text_displays.len(),
-        );
     }
 
     pub(super) fn pickup_arrow_geometry(
