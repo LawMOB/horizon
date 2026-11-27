@@ -33,8 +33,17 @@ jobs:
         run: cargo build --locked --profile ios --target aarch64-apple-ios -p horizon-game --bin horizon-client --no-default-features --features audio,horizon-extras
       - name: Package
         run: bash packaging/ios/package.sh target/aarch64-apple-ios/ios/horizon-client "$(sed -n 's/^version = "\(.*\)"/\1/p' crates/horizon-client/Cargo.toml | head -1)" dist
+      - name: Package for TrollStore Lite (jailbreak RAM)
+        env:
+          IOS_PROFILE: jailbreak-ram
+        run: bash packaging/ios/package.sh target/aarch64-apple-ios/ios/horizon-client "$(sed -n 's/^version = "\(.*\)"/\1/p' crates/horizon-client/Cargo.toml | head -1)" dist
       - uses: actions/upload-artifact@v4
         with:
           name: Horizon-ios
           path: dist/Horizon.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Horizon-ios-jailbreak-ram
+          path: dist/Horizon-jailbreak-ram.ipa
           if-no-files-found: error
