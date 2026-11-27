@@ -1,5 +1,8 @@
 //! GPU frame time from timestamp queries, read back a few frames late so the
 //! CPU never waits for it. Frames whose readback slot is still busy go untimed.
+//! Outside pass profiling, marker-only backends time every other frame: their two
+//! diagnostic passes are unnecessary on frames between samples. GPU statistics
+//! consume the arriving samples; skipped frames are not recorded as zero.
 //!
 //! Where the GPU can only time pass boundaries (Apple GPUs on Metal), a
 //! one-thread compute pass stamps the frame's start, and a render pass over
@@ -50,6 +53,25 @@ pub struct GpuTimer {
     markers: Option<Markers>,
     /// Slots resolved in this frame's commands, read back once it is submitted.
     resolved: Vec<usize>,
+    marker_sampling: MarkerSampling,
+}
+
+/// Keep marker passes out of alternate frames without interrupting pending readbacks.
+#[derive(Default)]
+struct MarkerSampling {
+    skip_next: bool,
+}
+
+impl MarkerSampling {
+    fn sample(&mut self, full_rate: bool) -> bool {
+        if full_rate {
+            self.skip_next = false;
+            return true;
+        }
+        let sample = !self.skip_next;
+        self.skip_next = sample;
+        sample
+    }
 }
 
 /// The marker passes: the start's compute pipeline, and the end's shader and
@@ -130,9 +152,23 @@ impl GpuTimer {
                 }
             }),
             resolved: Vec::new(),
+            marker_sampling: MarkerSampling::default(),
         })
     }
+    /// Time this frame at full rate, including marker-only backends.
     pub fn begin(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.begin_frame(encoder, true);
+    }
+    /// Encoder timestamps remain full rate. Marker passes sample alternate frames
+    /// unless a profiler requests every frame; completed slots still resolve each frame.
+    pub fn begin_sampled(&mut self, encoder: &mut wgpu::CommandEncoder, full_rate: bool) {
+        if full_rate || self.markers.is_none() {
+            self.begin(encoder);
+        } else {
+            self.begin_frame(encoder, false);
+        }
+    }
+    fn begin_frame(&mut self, encoder: &mut wgpu::CommandEncoder, full_rate: bool) {
         if self
             .slots
             .iter()
@@ -147,6 +183,10 @@ impl GpuTimer {
                     self.resolve(encoder, slot);
                 }
             }
+        }
+        if !self.marker_sampling.sample(full_rate) {
+            self.current = None;
+            return;
         }
         let slot = self.next;
         self.current = (self.slots[slot].state.load(Ordering::Acquire) == FREE).then_some(slot);
@@ -307,6 +347,21 @@ pub(super) fn end_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marker_samples_start_immediately_and_profiling_resets_the_cadence() {
+        let mut sampling = MarkerSampling::default();
+        let normal: Vec<_> = (0..6).map(|_| sampling.sample(false)).collect();
+        assert_eq!(normal, [true, false, true, false, true, false]);
+        // Enter profiling after a timed frame, when normal play would skip next.
+        assert!(sampling.sample(false));
+        for _ in 0..5 {
+            assert!(sampling.sample(true));
+        }
+        // Resume with a fresh sample rather than inheriting a skipped profiler slot.
+        assert!(sampling.sample(false));
+        assert!(!sampling.sample(false));
+    }
 
     fn mapped_timer() -> Option<(wgpu::Device, wgpu::Queue, GpuTimer)> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
