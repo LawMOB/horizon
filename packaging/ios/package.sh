@@ -6,6 +6,10 @@
 #
 #   packaging/ios/package.sh BINARY VERSION OUTDIR
 #
+# IOS_PROFILE=jailbreak-ram embeds memory entitlements with an ad-hoc signature for
+# TrollStore Lite on a jailbroken device, producing Horizon-jailbreak-ram.ipa.
+# The default standard profile produces Horizon.ipa.
+#
 # IOS_INSTANCE (digits) makes it a separate instance: identifier dev.horizon.game.i<digits>, link
 # horizon-i<digits>://, so it installs beside Horizon and other instances; IOS_NAME names it on the
 # home screen.
@@ -14,6 +18,18 @@
 # prepared resources into the app's Documents folder with the Files app (packaging/ios/README.md).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+profile=${IOS_PROFILE:-standard}
+case "$profile" in
+  standard) ipa_name=Horizon.ipa ;;
+  jailbreak-ram)
+    ipa_name=Horizon-jailbreak-ram.ipa
+    if [[ -n "${IOS_SIGN_IDENTITY:-}" || -n "${IOS_PROVISIONING_PROFILE:-}" ]]; then
+      echo "jailbreak-ram uses ad-hoc signing; unset IOS_SIGN_IDENTITY and IOS_PROVISIONING_PROFILE" >&2
+      exit 1
+    fi
+    ;;
+  *) echo "IOS_PROFILE must be standard or jailbreak-ram" >&2; exit 1 ;;
+esac
 binary=$1
 version=$2
 out=$(mkdir -p "$3" && cd "$3" && pwd)
@@ -46,11 +62,26 @@ printf 'APPL????' > "$app/PkgInfo"
 sips -z 120 120 "$icon" --out "$app/AppIcon60x60@2x.png" >/dev/null
 sips -z 180 180 "$icon" --out "$app/AppIcon60x60@3x.png" >/dev/null
 
-if [[ -n "${IOS_SIGN_IDENTITY:-}" ]]; then
+if [[ "$profile" == jailbreak-ram ]]; then
+  entitlements="$here/entitlements-jailbreak-ram.plist"
+  plutil -lint "$entitlements"
+  codesign --force --sign - --timestamp=none --generate-entitlement-der \
+    --entitlements "$entitlements" "$app"
+  codesign --verify --strict "$app"
+  # Check the signed executable, not just the input plist, before publishing the IPA.
+  codesign --display --entitlements - --xml "$app" > "$stage/signed-entitlements.plist"
+  for key in com.apple.developer.kernel.increased-memory-limit \
+             com.apple.developer.kernel.extended-virtual-addressing; do
+    [[ "$(/usr/libexec/PlistBuddy -c "Print :$key" "$stage/signed-entitlements.plist")" == true ]] || {
+      echo "Missing signed entitlement: $key" >&2
+      exit 1
+    }
+  done
+elif [[ -n "${IOS_SIGN_IDENTITY:-}" ]]; then
   cp "$IOS_PROVISIONING_PROFILE" "$app/embedded.mobileprovision"
   codesign --force --sign "$IOS_SIGN_IDENTITY" --timestamp=none "$app"
 fi
 
-rm -f "$out/Horizon.ipa"
-(cd "$stage" && ditto -c -k --sequesterRsrc --keepParent Payload "$out/Horizon.ipa")
-echo "$out/Horizon.ipa"
+rm -f "$out/$ipa_name"
+(cd "$stage" && ditto -c -k --sequesterRsrc --keepParent Payload "$out/$ipa_name")
+echo "$out/$ipa_name"
