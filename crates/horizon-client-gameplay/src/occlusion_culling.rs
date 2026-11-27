@@ -1743,7 +1743,9 @@ fn cull_job(
         hidden.reserve(job.queries.len() - hidden.capacity());
     }
     let mut visible = job.clear_visible;
-    visible.clear();
+    if !job.rays_filtered {
+        visible.clear();
+    }
     let mut deferred_entities = 0;
     let mut cancelled = false;
     for &key in &job.queries {
@@ -2168,6 +2170,54 @@ mod tests {
             &mut last_chunk,
             &mut opacity_grid,
         ));
+        drop(live);
+    }
+
+    #[test]
+    fn ray_visible_answers_survive_the_plane_stage_and_enter_the_result_cache() {
+        let (snapshot, live) = wall(None);
+        let camera = [0.25; 3];
+        for include_hidden in [false, true] {
+            let mut job = job(Arc::clone(&snapshot));
+            job.queries[0].camera = camera.map(f64::to_bits);
+            let hidden = job.queries[0];
+            let clear = CullKey {
+                camera: camera.map(f64::to_bits),
+                min: [1.95, -0.55, -0.55].map(f64::to_bits),
+                max: [2.05, 0.55, 0.55].map(f64::to_bits),
+            };
+            if !include_hidden {
+                job.queries.clear();
+            }
+            job.queries.push(clear);
+            let generation = AtomicU64::new(0);
+            filter_rays(&mut job, &generation, &mut RayWorkerScratch::default());
+            assert_eq!(job.clear_visible, vec![clear]);
+            assert_eq!(job.queries.len(), usize::from(include_hidden));
+
+            let mut results = cull_job(job, &generation, &mut PlaneWorkerScratch::default());
+            assert_eq!(results.camera, camera.map(f64::to_bits));
+            assert!(!results.cancelled);
+            assert_eq!(results.visible, vec![clear]);
+            assert_eq!(results.visible_entities, 1);
+            assert_eq!(results.hidden.len(), usize::from(include_hidden));
+
+            let mut culler = AsyncOcclusionCuller::new().unwrap();
+            culler.camera = camera;
+            culler.stamp = results.stamp;
+            culler.query_cache_camera_cell = camera_cell(camera);
+            culler.cache_results_for_camera(&mut results, camera.map(f64::to_bits));
+            assert!(matches!(
+                culler.query_result(&clear, QuerySource::EntityAabb),
+                Some((false, None))
+            ));
+            if include_hidden {
+                assert!(matches!(
+                    culler.query_result(&hidden, QuerySource::EntityAabb),
+                    Some((true, Some(_)))
+                ));
+            }
+        }
         drop(live);
     }
 
