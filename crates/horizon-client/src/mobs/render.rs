@@ -565,10 +565,68 @@ pub fn body_color(m: &Mob, alpha: f32) -> u32 {
 /// Extra render layers drawn over the body with the same pose. `age` is the
 /// render state's `ageInTicks` (`Mob.age` plus the partial tick).
 pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
+    let mut layers = Vec::new();
+    layers_into(m, age, &mut layers);
+    layers
+}
+
+thread_local! {
+    /// Spare layer lists for ordinary world rendering, bounded per thread.
+    static LAYER_POOL: std::cell::RefCell<Vec<Vec<Layer>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A frame's layers, cleared and returned to this thread's pool on every exit.
+struct PooledLayers(Vec<Layer>);
+
+impl PooledLayers {
+    fn for_mob(m: &Mob, age: f32) -> Self {
+        let mut layers = Self(
+            LAYER_POOL
+                .try_with(|pool| pool.borrow_mut().pop())
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
+        layers_into(m, age, &mut layers.0);
+        layers
+    }
+}
+
+impl std::ops::Deref for PooledLayers {
+    type Target = Vec<Layer>;
+    fn deref(&self) -> &Vec<Layer> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PooledLayers {
+    fn deref_mut(&mut self) -> &mut Vec<Layer> {
+        &mut self.0
+    }
+}
+
+impl Drop for PooledLayers {
+    fn drop(&mut self) {
+        self.0.clear();
+        // Retain ordinary body/equipment lists, not an unusually large one.
+        if self.0.capacity() > 32 {
+            return;
+        }
+        let _ = LAYER_POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < 8 {
+                pool.push(std::mem::take(&mut self.0));
+            }
+        });
+    }
+}
+
+/// Refills the scratch list, including when the mob has no visible layers.
+fn layers_into(m: &Mob, age: f32, v: &mut Vec<Layer>) {
     use Species as S;
-    let mut v = Vec::new();
+    v.clear();
     if avatar(m) {
-        return v;
+        return;
     }
     let white = 0xFFFF_FFFF;
     fn push(
@@ -599,7 +657,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 let left = (super::WOLF_ARMOR_DURABILITY - m.extra.body_damage()) as f32
                     / super::WOLF_ARMOR_DURABILITY as f32;
                 push(
-                    &mut v,
+                    v,
                     "wolf_armor#main",
                     "entity/equipment/wolf_body/armadillo_scute",
                     white,
@@ -610,7 +668,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                     .find(|(t, _)| left < *t);
                 if let Some((_, level)) = crack {
                     push(
-                        &mut v,
+                        v,
                         "wolf_armor#main",
                         interned(format_args!("entity/wolf/wolf_armor_crackiness_{level}")),
                         white,
@@ -619,7 +677,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 }
             }
             push(
-                &mut v,
+                v,
                 model,
                 texture,
                 abgr(dye(m.extra.color as usize)),
@@ -636,7 +694,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 && let Some(texture) = &harness
             {
                 push(
-                    &mut v,
+                    v,
                     "happy_ghast_harness#main",
                     texture.clone(),
                     white,
@@ -652,7 +710,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                     "happy_ghast_ropes#main"
                 };
                 push(
-                    &mut v,
+                    v,
                     model,
                     "entity/ghast/happy_ghast_ropes",
                     white,
@@ -672,7 +730,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 scroll: scroll_offset(age, BREEZE_WIND_SCROLL),
             });
             push(
-                &mut v,
+                v,
                 "breeze#eyes",
                 "entity/breeze/breeze_eyes",
                 white,
@@ -682,7 +740,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         // LlamaDecorLayer: the carpet, or the trader's blanket.
         S::Llama | S::TraderLlama => {
             if let Some((model, texture)) = super::llama::decor(m) {
-                push(&mut v, model, texture, white, false);
+                push(v, model, texture, white, false);
             }
         }
         // HorseMarkingLayer, the saddle and the horse armour.
@@ -694,11 +752,11 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 interned(format_args!("{name}#main"))
             };
             if let Some(tex) = super::equine::markings(m) {
-                push(&mut v, body, tex, white, false);
+                push(v, body, tex, white, false);
             }
             if m.extra.saddled() && !m.is_baby() {
                 push(
-                    &mut v,
+                    v,
                     interned(format_args!("{name}#saddle")),
                     super::equine::saddle_texture(s),
                     white,
@@ -722,19 +780,19 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 } else {
                     "horse_armor#main"
                 };
-                push(&mut v, layer, tex, color, false);
+                push(v, layer, tex, color, false);
             }
         }
         // SimpleEquipmentLayer: pig and strider saddles.
         S::Pig if m.extra.saddled() && !m.is_baby() => push(
-            &mut v,
+            v,
             "pig#saddle",
             "entity/equipment/pig_saddle/saddle",
             white,
             false,
         ),
         S::Strider if m.extra.saddled() && !m.is_baby() => push(
-            &mut v,
+            v,
             "strider#saddle",
             "entity/equipment/strider_saddle/saddle",
             white,
@@ -748,7 +806,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 ("cat#collar", "entity/cat/cat_collar")
             };
             push(
-                &mut v,
+                v,
                 model,
                 texture,
                 abgr(dye(m.extra.color as usize)),
@@ -758,17 +816,17 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         // IronGolemCrackinessLayer.
         S::IronGolem => {
             if let Some(texture) = super::golem::crackiness(m) {
-                push(&mut v, "iron_golem#main", texture, white, false);
+                push(v, "iron_golem#main", texture, white, false);
             }
         }
         // NautilusRenderer: the armour and saddle SimpleEquipmentLayers.
         S::Nautilus | S::ZombieNautilus if !m.is_baby() => {
             if let Some(texture) = m.extra.body_id().and_then(super::nautilus::armor_texture) {
-                push(&mut v, "nautilus_armor#main", texture, white, false);
+                push(v, "nautilus_armor#main", texture, white, false);
             }
             if m.extra.saddled() {
                 push(
-                    &mut v,
+                    v,
                     "nautilus#saddle",
                     "entity/equipment/nautilus_saddle/saddle",
                     white,
@@ -779,11 +837,11 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         // SulfurCubeInnerLayer.
         S::SulfurCube => {
             if let Some((model, texture)) = super::sulfur_cube::inner(m) {
-                push(&mut v, model, texture, white, false);
+                push(v, model, texture, white, false);
             }
         }
         // SlimeOuterLayer: the translucent outer cube.
-        S::Slime => push(&mut v, "slime#outer", "entity/slime/slime", white, false),
+        S::Slime => push(v, "slime#outer", "entity/slime/slime", white, false),
         // SheepWoolUndercoatLayer has no isSheared guard: a sheared dyed sheep
         // keeps it, while only SheepWoolLayer stops.
         S::Sheep => {
@@ -796,7 +854,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
             });
             if !m.is_baby() && (jeb || m.extra.color != 0) {
                 push(
-                    &mut v,
+                    v,
                     "sheep#wool_undercoat",
                     "entity/sheep/sheep_wool_undercoat",
                     color,
@@ -810,11 +868,11 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 } else {
                     ("sheep#wool", "entity/sheep/sheep_wool")
                 };
-                push(&mut v, model, texture, color, false);
+                push(v, model, texture, color, false);
             }
         }
         S::Creaking if super::creaking::eyes_glowing(m) => push(
-            &mut v,
+            v,
             "creaking#eyes",
             "entity/creaking/creaking_eyes",
             white,
@@ -825,24 +883,24 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         // from ModelLayers.COPPER_GOLEM, the body's, not COPPER_GOLEM_EYES.
         S::CopperGolem => {
             let eyes = super::copper_golem::eye_texture(m);
-            push(&mut v, m.kind.model_name(), eyes, white, true);
+            push(v, m.kind.model_name(), eyes, white, true);
         }
         S::Spider | S::CaveSpider => push(
-            &mut v,
+            v,
             m.kind.model_name(),
             "entity/spider/spider_eyes",
             white,
             true,
         ),
         S::Enderman => push(
-            &mut v,
+            v,
             "enderman#main",
             "entity/enderman/enderman_eyes",
             white,
             true,
         ),
         S::Phantom => push(
-            &mut v,
+            v,
             "phantom#main",
             "entity/phantom/phantom_eyes",
             white,
@@ -851,7 +909,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         S::Drowned => {
             if m.is_baby() {
                 push(
-                    &mut v,
+                    v,
                     "drowned_baby#outer",
                     "entity/zombie/drowned_outer_layer_baby",
                     white,
@@ -859,7 +917,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 );
             } else {
                 push(
-                    &mut v,
+                    v,
                     "drowned#outer",
                     "entity/zombie/drowned_outer_layer",
                     white,
@@ -868,14 +926,14 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
             }
         }
         S::Stray => push(
-            &mut v,
+            v,
             "stray#outer",
             "entity/skeleton/stray_overlay",
             white,
             false,
         ),
         S::Bogged if !m.extra.sheared => push(
-            &mut v,
+            v,
             "bogged#outer",
             "entity/skeleton/bogged_overlay",
             white,
@@ -889,7 +947,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 ("tropical_fish_large#pattern", "b", m.extra.variant - 5)
             };
             push(
-                &mut v,
+                v,
                 model,
                 interned(format_args!("entity/fish/tropical_{letter}_pattern_{n}")),
                 abgr(dye(m.extra.variant3 as usize)),
@@ -916,7 +974,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
             // VillagerProfessionLayer: a baby's type texture is in `baby/`.
             let group = if m.is_baby() { "baby" } else { "type" };
             push(
-                &mut v,
+                v,
                 model.clone(),
                 interned(format_args!("{folder}/{group}/{t}")),
                 white,
@@ -929,13 +987,13 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                     folder == "entity/zombie_villager",
                 )
             {
-                push(&mut v, model.clone(), texture, white, false);
+                push(v, model.clone(), texture, white, false);
                 if !nitwit {
                     // `LEVEL_LOCATIONS` clamps the level to 1..=5.
                     let level = ["stone", "iron", "gold", "emerald", "diamond"]
                         [(m.extra.villager_level.max(1) as usize - 1).min(4)];
                     push(
-                        &mut v,
+                        v,
                         model,
                         interned(format_args!("{folder}/profession_level/{level}")),
                         white,
@@ -946,8 +1004,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         }
         _ => {}
     }
-    humanoid_armor(m, &mut v);
-    v
+    humanoid_armor(m, v);
 }
 /// `HumanoidArmorLayer.renderArmorPiece`: a baby wears the `humanoid_baby`
 /// layer type for every slot (leggings included), an adult the leggings layer
@@ -2152,7 +2209,7 @@ fn render_visible(
     if let Some(animation) = body_animation {
         animation.run(m, &s, &mut poses);
     }
-    let mut all_layers = layers(m, s.age);
+    let mut all_layers = PooledLayers::for_mob(m, s.age);
     // WardenRenderer: the translucent emissive layers fade with the animations.
     if m.species() == Species::Warden {
         for (model, texture, a) in super::warden::emissive_layers(m, alpha) {
@@ -3791,6 +3848,36 @@ mod scroll_tests {
                 layer("sheep#wool_undercoat", "entity/sheep/sheep_wool_undercoat"),
                 layer("sheep#wool", "entity/sheep/sheep_wool")
             ]
+        );
+
+        // Consecutive world draws reuse the layer list, but keep no wool from
+        // the previous sheep: two layers, none, a baby layer, then undercoat.
+        let pooled_wool = |m: &Mob| -> Vec<(String, String, u32)> {
+            let layers = PooledLayers::for_mob(m, 0.0);
+            layers
+                .iter()
+                .filter(|l| l.model.contains("#wool"))
+                .map(|l| (l.model.to_string(), l.texture.to_string(), l.color))
+                .collect()
+        };
+        assert_eq!(
+            pooled_wool(&sheep(1, false, false)),
+            [
+                layer("sheep#wool_undercoat", "entity/sheep/sheep_wool_undercoat"),
+                layer("sheep#wool", "entity/sheep/sheep_wool")
+            ]
+        );
+        assert!(pooled_wool(&sheep(0, true, false)).is_empty());
+        assert_eq!(
+            pooled_wool(&sheep(1, false, true)),
+            [layer("sheep_baby#wool", "entity/sheep/sheep_wool_baby")]
+        );
+        assert_eq!(
+            pooled_wool(&sheep(1, true, false)),
+            [layer(
+                "sheep#wool_undercoat",
+                "entity/sheep/sheep_wool_undercoat"
+            )]
         );
     }
 
