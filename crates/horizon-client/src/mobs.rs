@@ -2867,10 +2867,47 @@ pub fn take_mob_pushes(events: &mut Vec<MobEvent>, from: usize, pending: &mut Pe
 /// Pushes waiting for their mob's tick, in push order. A list while short;
 /// past [`PendingPushes::LIST_MAX`] (a crowd pushing each other) one list
 /// per mob, as scanning the whole list for each mob grows with its square.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct PendingPushes {
     list: Vec<(u32, Vec3)>,
     by_mob: crate::fast_hash::FxHashMap<u32, Vec<Vec3>>,
+    recycled: PushBufferPool,
+}
+impl Clone for PendingPushes {
+    fn clone(&self) -> Self {
+        Self {
+            list: self.list.clone(),
+            by_mob: self.by_mob.clone(),
+            recycled: PushBufferPool::default(),
+        }
+    }
+}
+#[derive(Default)]
+struct PushBufferPool {
+    buffers: Vec<Vec<Vec3>>,
+    bytes: usize,
+}
+impl PushBufferPool {
+    const MAX_BYTES: usize = 1024 * 1024;
+    const MAX_BUFFERS: usize = 256;
+
+    fn take(&mut self) -> Vec<Vec3> {
+        let pushes = self.buffers.pop().unwrap_or_default();
+        self.bytes -= pushes.capacity() * std::mem::size_of::<Vec3>();
+        pushes
+    }
+
+    fn recycle(&mut self, mut pushes: Vec<Vec3>) {
+        let bytes = pushes.capacity().saturating_mul(std::mem::size_of::<Vec3>());
+        if self.buffers.len() >= Self::MAX_BUFFERS
+            || bytes > Self::MAX_BYTES.saturating_sub(self.bytes)
+        {
+            return;
+        }
+        pushes.clear();
+        self.bytes += bytes;
+        self.buffers.push(pushes);
+    }
 }
 impl PendingPushes {
     /// `other`'s pushes after these, each mob's in their order.
@@ -2889,16 +2926,31 @@ impl PendingPushes {
     pub fn is_empty(&self) -> bool {
         self.list.is_empty() && self.by_mob.is_empty()
     }
+    /// Retire leftover targets without reallocating a crowd's queues next tick.
+    pub fn clear(&mut self) {
+        self.list.clear();
+        for (_, pushes) in self.by_mob.drain() {
+            self.recycled.recycle(pushes);
+        }
+    }
     pub fn push(&mut self, id: u32, v: Vec3) {
         if self.by_mob.is_empty() && self.list.len() < Self::LIST_MAX {
             self.list.push((id, v));
             return;
         }
-        // Older pushes first, so each mob's stay in order.
+        // Older pushes first, so each mob's stay in order. Consumed targets
+        // return their buffers here instead of allocating for every crowd tick.
+        let recycled = &mut self.recycled;
         for (id, v) in self.list.drain(..) {
-            self.by_mob.entry(id).or_default().push(v);
+            self.by_mob
+                .entry(id)
+                .or_insert_with(|| recycled.take())
+                .push(v);
         }
-        self.by_mob.entry(id).or_default().push(v);
+        self.by_mob
+            .entry(id)
+            .or_insert_with(|| recycled.take())
+            .push(v);
     }
 }
 #[cfg(test)]
@@ -5632,7 +5684,37 @@ mod push_tests {
                         "{n} mobs, tick {tick}, mob {i}"
                     );
                 }
+                assert!(pending.is_empty());
+                assert!(pending.recycled.bytes <= PushBufferPool::MAX_BYTES);
+                assert!(pending.recycled.buffers.len() <= PushBufferPool::MAX_BUFFERS);
             }
+            let buffers: Vec<_> = pending.recycled.buffers.iter().map(Vec::as_ptr).collect();
+            for i in 0..128u32 {
+                let id = i % n;
+                let x = [1.0e16, 1.0, -1.0e16, 0.5][i as usize % 4];
+                let v = Vec3::new(x, -x, x * 0.25);
+                pending.push(id, v);
+                old_pending.push((id, v));
+            }
+            if n >= 20 {
+                assert!(pending.by_mob.values().any(|pushes| buffers.contains(&pushes.as_ptr())));
+            }
+            for i in 0..n as usize {
+                apply_mob_pushes(&mut new_mobs[i], &mut pending);
+                apply_old(&mut old_v[i], i as u32, &mut old_pending);
+                let (a, b) = (new_mobs[i].velocity, old_v[i]);
+                assert_eq!(
+                    (a.x.to_bits(), a.y.to_bits(), a.z.to_bits()),
+                    (b.x.to_bits(), b.y.to_bits(), b.z.to_bits()),
+                    "{n} mobs, recycled queue, mob {i}"
+                );
+            }
+            // Removed targets retire at a successful sweep without clearing the cache.
+            pending.push(u32::MAX, Vec3::new(1.0, 0.0, 0.0));
+            pending.clear();
+            assert!(pending.is_empty());
+            assert!(pending.clone().is_empty());
+            assert!(pending.recycled.bytes <= PushBufferPool::MAX_BYTES);
         }
     }
 
@@ -7205,9 +7287,10 @@ pub fn apply_mob_pushes(m: &mut Mob, pending: &mut PendingPushes) {
         });
     }
     if !pending.by_mob.is_empty()
-        && let Some(pushes) = pending.by_mob.remove(&m.id)
+        && let Some(mut pushes) = pending.by_mob.remove(&m.id)
     {
-        pushes.into_iter().for_each(add);
+        pushes.drain(..).for_each(add);
+        pending.recycled.recycle(pushes);
     }
 }
 #[cfg(test)]
