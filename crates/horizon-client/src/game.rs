@@ -1881,8 +1881,6 @@ struct Game<'a> {
     /// The last world frame reached the swap chain. A window the compositor
     /// stops showing gets no frames, and the event loop must not spin on it.
     frame_drawn: bool,
-    #[cfg(target_os = "ios")]
-    ios_frame_pacing: event_loop::IosFramePacing,
     /// The world list's icon in progress (`GameRenderer.tryTakeScreenshotIfNeeded`):
     /// `None` without a local world, or once the save has its icon.png.
     world_icon: Option<WorldIcon>,
@@ -7908,10 +7906,6 @@ impl Game<'_> {
             Err(_) if self.renderer.as_ref().is_some_and(Renderer::device_lost) => false,
             result => result?,
         };
-        #[cfg(target_os = "ios")]
-        {
-            self.frame_drawn = rendered;
-        }
         self.finish_render_frame(elapsed);
         if rendered {
             // The submit thread may still hold the frame: a listener hears it after the
@@ -10998,8 +10992,6 @@ impl<'a> Game<'a> {
             pending_save: None,
             server_tick_deadline: None,
             frame_drawn: true,
-            #[cfg(target_os = "ios")]
-            ios_frame_pacing: Default::default(),
             world_icon: None,
             forced_hit: None,
             tick_hit: Default::default(),
