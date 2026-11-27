@@ -18,6 +18,7 @@ use super::{
     path::{PATH_TYPES, Path},
     push::{Cap, Verdict, root_vehicle},
     undead,
+    world::PushTarget,
 };
 use crate::blocks::Fluid;
 use crate::breathing::{Breath, breathe, drown, own_air};
@@ -2506,7 +2507,14 @@ fn push_entities(
         && p.bounds.intersects(bounds)
         && crate::scoreboard::pushable_by(own, w.teams.of(Who::Player), true)
     {
-        targets.push((Who::Player, p.position, p.passenger, false, false));
+        targets.push(PushTarget {
+            who: Who::Player,
+            position: p.position,
+            passenger: p.passenger,
+            same_vehicle: false,
+            vehicle: false,
+            sleeping: false,
+        });
     }
     for o in w.others_near(bounds) {
         if o.id != m.id
@@ -2516,7 +2524,14 @@ fn push_entities(
             && crate::scoreboard::pushable_by(own, w.teams.of(Who::Mob(o.id)), true)
         {
             let same = root_vehicle(w, o.id, o.vehicle) == root;
-            targets.push((Who::Mob(o.id), o.position, o.passenger, same, o.is_vehicle));
+            targets.push(PushTarget {
+                who: Who::Mob(o.id),
+                position: o.position,
+                passenger: o.passenger,
+                same_vehicle: same,
+                vehicle: o.is_vehicle,
+                sleeping: o.sleeping,
+            });
         }
     }
     // Cramming: a quarter of the ticks spent with `maxEntityCramming` or more
@@ -2525,13 +2540,19 @@ fn push_entities(
     if limit > 0
         && targets.len() as i64 > i64::from(limit) - 1
         && m.random.next_int_bound(4).unwrap_or(1) == 0
-        && targets.iter().filter(|t| !t.2).count() as i64 > i64::from(limit) - 1
+        && targets.iter().filter(|t| !t.passenger).count() as i64 > i64::from(limit) - 1
     {
         m.damage(level, 6.0, Damage::of(DamageKind::Cramming));
     }
     // The server's collision cap, after the cramming check above, which counts every entity.
     let mut cap = Cap::new(m, w);
-    for &(who, at, _, same, vehicle) in &targets {
+    for target in &targets {
+        let (who, at, same, vehicle) = (
+            target.who,
+            target.position,
+            target.same_vehicle,
+            target.vehicle,
+        );
         match cap.check(who, w) {
             Verdict::Push => {}
             Verdict::Skip => continue,
@@ -2553,7 +2574,7 @@ fn push_entities(
         // doPush calls the other living entity's push; sleeping vetoes both impulses.
         let sleeping = match who {
             Who::Player => w.selected_player().is_some_and(|p| p.sleeping),
-            Who::Mob(id) => w.seen(id).is_some_and(|o| o.sleeping),
+            Who::Mob(_) => target.sleeping,
         };
         if sleeping {
             continue;
