@@ -16,6 +16,7 @@
 use horizon_shader_api::stages::RAY_ENTITY_QUAD;
 
 use super::native_entity::EntityRuns;
+use super::pack_timing::PassTiming;
 use super::upload::Uploads;
 use crate::mesher::Vertex;
 
@@ -344,6 +345,7 @@ impl EntitySkin {
         out: &wgpu::Buffer,
         base: u32,
         outline_base: u32,
+        timing: Option<&mut PassTiming>,
     ) {
         let kinds = std::mem::take(&mut self.kinds);
         let bits = kinds.bits(frame.jobs.iter().map(|job| job.dst));
@@ -365,6 +367,7 @@ impl EntitySkin {
                     ..*job
                 })),
             out,
+            timing,
         );
         self.kinds = kinds;
         self.kinds.clear();
@@ -382,6 +385,7 @@ impl EntitySkin {
         out: &wgpu::Buffer,
         outline_out: &wgpu::Buffer,
         outline_base: u32,
+        mut timing: Option<&mut PassTiming>,
     ) {
         self.dispatch_jobs(
             device,
@@ -390,6 +394,7 @@ impl EntitySkin {
             &frame.parts,
             frame.jobs.iter().copied(),
             out,
+            timing.as_deref_mut(),
         );
         self.dispatch_jobs(
             device,
@@ -401,6 +406,7 @@ impl EntitySkin {
                 ..*job
             }),
             outline_out,
+            timing,
         );
     }
 
@@ -413,6 +419,7 @@ impl EntitySkin {
         parts: &[SkinPart],
         jobs: impl Iterator<Item = SkinJob>,
         out: &wgpu::Buffer,
+        timing: Option<&mut PassTiming>,
     ) {
         self.staged.clear();
         self.staged.extend(jobs);
@@ -467,7 +474,7 @@ impl EntitySkin {
         };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Entity skinning"),
-            timestamp_writes: None,
+            timestamp_writes: timing.and_then(|t| t.compute_writes("Entity skinning")),
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, group, &[]);
@@ -758,6 +765,7 @@ mod tests {
             &out,
             before,
             outline_base,
+            None,
         );
         let read = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -831,6 +839,7 @@ mod tests {
             &buffers[0],
             &buffers[1],
             before,
+            None,
         );
         for (buffer, read) in buffers.iter().zip(&reads) {
             encoder.copy_buffer_to_buffer(buffer, 0, read, 0, buffer.size());
@@ -945,6 +954,7 @@ mod tests {
             &out,
             0,
             outline_base,
+            None,
         );
         assert_eq!(skin.kinds, EntityRuns::default(), "one frame's runs");
         encoder.copy_buffer_to_buffer(&out, 0, &read, 0, size);
