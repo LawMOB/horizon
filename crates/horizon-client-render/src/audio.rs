@@ -96,12 +96,17 @@ impl Muffle {
         }
     }
 }
+type ListenerTransform = ([f64; 3], f32, f32);
+type ListenerUpdates = Arc<Mutex<HashMap<u8, ListenerTransform>>>;
+
 #[derive(Default)]
 struct Mixer {
     channels: HashMap<ChannelId, Channel>,
     listener: [f64; 3],
     listener_yaw: f32,
     listener_pitch: f32,
+    /// Latest camera transform per owner, separate from the lock held while mixing samples.
+    listener_updates: ListenerUpdates,
     /// Splitscreen: the other players' cameras (position, yaw, pitch) by owner. A world sound is
     /// heard from the nearest camera, and panned half as wide while several share the speakers.
     listeners: HashMap<u8, ([f64; 3], f32, f32)>,
@@ -298,6 +303,26 @@ struct ModAudioChunk {
     at: Option<[f64; 3]>,
 }
 impl Mixer {
+    fn apply_listener(&mut self, owner: u8, (position, yaw, pitch): ListenerTransform) {
+        if owner == 0 {
+            self.listener = position;
+            self.listener_yaw = yaw;
+            self.listener_pitch = pitch;
+        } else {
+            self.listeners.insert(owner, (position, yaw, pitch));
+        }
+    }
+
+    fn sync_listeners(&mut self) {
+        let updates = self.listener_updates.clone();
+        let Ok(mut pending) = updates.try_lock() else {
+            return;
+        };
+        for (owner, transform) in pending.drain() {
+            self.apply_listener(owner, transform);
+        }
+    }
+
     /// Queues `samples` behind what `source` of `mod_id` already has waiting. False, and
     /// nothing queued, when they are empty or the rate is 0, when the source would hold more
     /// than [`MOD_AUDIO_SECONDS`], or when a new source would pass [`MOD_AUDIO_SOURCES`].
@@ -390,6 +415,26 @@ impl MuffleFade {
     }
 }
 impl MixerBackend {
+    fn update_listener(&self, transform: ListenerTransform) {
+        match self.mixer.try_lock() {
+            Ok(mut mixer) => {
+                // A newer immediate transform must replace any earlier queued one.
+                if let Ok(mut pending) = self.listener_updates.lock() {
+                    pending.remove(&self.owner);
+                }
+                mixer.apply_listener(self.owner, transform);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // The callback never holds this mailbox during sample mixing. Keep
+                // one transform per owner, including when the camera stops moving.
+                if let Ok(mut pending) = self.listener_updates.lock() {
+                    pending.insert(self.owner, transform);
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {}
+        }
+    }
+
     /// Queues a mod's audio for the output callback (`Host::push_voice`). False when nothing
     /// was queued: no output device, or what [`Mixer::push_mod_audio`] refuses.
     pub fn push_voice(
@@ -410,6 +455,7 @@ impl MixerBackend {
 /// The mixer side of the engine (`Backend`).
 pub struct MixerBackend {
     mixer: Arc<Mutex<Mixer>>,
+    listener_updates: ListenerUpdates,
     root: ResourceSource,
     cache: Arc<Mutex<SoundCache>>,
     /// The decoder thread for static sounds, started with the first one.
@@ -431,6 +477,9 @@ impl Drop for MixerBackend {
         self.shares
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut m) = self.mixer.lock() {
+            if let Ok(mut pending) = self.listener_updates.lock() {
+                pending.remove(&self.owner);
+            }
             m.listeners.remove(&self.owner);
             m.worlds.remove(&self.owner);
             let owner = self.owner;
@@ -953,6 +1002,7 @@ fn distance_gain(linear: Option<f32>, distance: f32) -> f32 {
 // Only the output stream mixes; a build without one (no `audio` feature) never does.
 #[cfg_attr(not(feature = "audio"), allow(dead_code))]
 fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
+    mixer.sync_listeners();
     data.fill(0.0);
     // The camera's forward and up vectors (`Camera.forwardVector`/`upVector`)
     // and OpenAL's right = forward x up.
@@ -1521,7 +1571,9 @@ impl Audio {
                  launcher (or run horizon-prepare sounds)"
             );
         }
-        let mixer = Arc::new(Mutex::new(Mixer::default()));
+        let mixer = Mixer::default();
+        let listener_updates = mixer.listener_updates.clone();
+        let mixer = Arc::new(Mutex::new(mixer));
         let opened = if output {
             Self::open_named(mixer.clone(), target_device)
         } else {
@@ -1557,6 +1609,7 @@ impl Audio {
             engine,
             backend: MixerBackend {
                 mixer,
+                listener_updates,
                 root: root.to_owned(),
                 cache: Arc::default(),
                 decoder: None,
@@ -1700,16 +1753,7 @@ impl Audio {
         self.listener = position;
         self.listener_yaw = yaw;
         self.listener_pitch = pitch;
-        if let Ok(mut m) = self.backend.mixer.lock() {
-            if self.backend.owner == 0 {
-                m.listener = position;
-                m.listener_yaw = yaw;
-                m.listener_pitch = pitch;
-            } else {
-                m.listeners
-                    .insert(self.backend.owner, (position, yaw, pitch));
-            }
-        }
+        self.backend.update_listener((position, yaw, pitch));
     }
     /// Splitscreen: another player's sounds on this output, heard from its camera too
     /// (`owner`: 1 to 255, its own). Dropped, its camera and sounds go.
@@ -1726,6 +1770,7 @@ impl Audio {
             engine,
             backend: MixerBackend {
                 mixer: self.backend.mixer.clone(),
+                listener_updates: self.backend.listener_updates.clone(),
                 root: self.backend.root.clone(),
                 cache: self.backend.cache.clone(),
                 decoder: None,
@@ -3084,6 +3129,50 @@ mod tests {
     }
 
     #[test]
+    fn camera_updates_do_not_wait_for_sample_mixing_or_lose_the_last_pose() {
+        let mut host = Audio::silent(&ResourceSource::indexed(Default::default()));
+        let mut guest = host.share(1);
+        let mixer = host.backend.mixer.clone();
+        let held = mixer.lock().unwrap();
+        // The callback holds this lock for a whole sample buffer. Updating
+        // either camera must still return and retain only its latest pose.
+        host.set_listener([1.0, 2.0, 3.0], 10.0, 20.0);
+        host.set_listener([4.0, 5.0, 6.0], 30.0, 40.0);
+        guest.set_listener([7.0, 8.0, 9.0], 50.0, 60.0);
+        assert_eq!(host.listener, [4.0, 5.0, 6.0]);
+        assert_eq!(host.listener_yaw, 30.0);
+        assert_eq!(host.listener_pitch, 40.0);
+        assert_eq!(host.backend.listener_updates.lock().unwrap().len(), 2);
+        drop(held);
+
+        // No further camera movement: the next buffer still gets the update.
+        let mut samples = [0.0; 2];
+        host.mix_buffer(&mut samples, 2, 48_000);
+        {
+            let mixed = mixer.lock().unwrap();
+            assert_eq!(mixed.listener, [4.0, 5.0, 6.0]);
+            assert_eq!((mixed.listener_yaw, mixed.listener_pitch), (30.0, 40.0));
+            assert_eq!(mixed.listeners[&1], ([7.0, 8.0, 9.0], 50.0, 60.0));
+            assert!(host.backend.listener_updates.lock().unwrap().is_empty());
+        }
+
+        // An immediate update supersedes an older transform still queued.
+        let held = mixer.lock().unwrap();
+        host.set_listener([10.0; 3], 70.0, 80.0);
+        guest.set_listener([11.0; 3], 90.0, 100.0);
+        drop(held);
+        host.set_listener([12.0; 3], 110.0, 120.0);
+        // A departed splitscreen player must not be restored by its mailbox.
+        drop(guest);
+        host.mix_buffer(&mut samples, 2, 48_000);
+        let mixed = mixer.lock().unwrap();
+        assert_eq!(mixed.listener, [12.0; 3]);
+        assert_eq!((mixed.listener_yaw, mixed.listener_pitch), (110.0, 120.0));
+        assert!(!mixed.listeners.contains_key(&1));
+        assert!(host.backend.listener_updates.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn cameras_in_other_dimensions_cannot_hear_a_source() {
         let mut m = Mixer {
             listener: [100.0, 0.0, 0.0],
@@ -3168,8 +3257,10 @@ mod tests {
         let mixer = Arc::new(Mutex::new(Mixer::default()));
         // One other player shares the output.
         let shares = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let listener_updates = mixer.lock().unwrap().listener_updates.clone();
         let backend = |owner| MixerBackend {
             mixer: mixer.clone(),
+            listener_updates: listener_updates.clone(),
             root: ResourceSource::indexed(Default::default()),
             cache: Arc::default(),
             decoder: None,
