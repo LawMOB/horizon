@@ -278,6 +278,15 @@ impl Game<'_> {
                 riders.entry(v).or_default().push(j);
             }
         }
+        // The local player's tick calls this even when nothing rides anything.
+        // A crowd without passengers needs no full mob index or seating passes.
+        if riders.is_empty()
+            && !self.text_displays.values().any(|d| d.vehicle.is_some())
+            && !self.interactions.values().any(|i| i.vehicle.is_some())
+            && !self.armor_stands.iter().any(|a| a.vehicle.is_some())
+        {
+            return;
+        }
         self.seat_boat_mobs(&riders);
         self.seat_cart_mobs(&riders);
         self.seat_tnt_mobs(&riders);
