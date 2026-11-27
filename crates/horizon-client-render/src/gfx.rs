@@ -7513,6 +7513,11 @@ impl Renderer {
                     label: Some("Horizon frame"),
                 })
         });
+        // Include animation, uploads and GPU entity posing before the render passes.
+        // Section copies already staged in this reused encoder remain outside the interval.
+        if let Some(timer) = &mut self.gpu_timer {
+            timer.begin(&mut encoder);
+        }
         // Horizon's own passes are timed like a shader pack's, from the frame's first pass.
         if self.own_timing.is_some() != self.pass_timing {
             self.own_timing = self
@@ -8931,6 +8936,7 @@ impl Renderer {
                     target,
                     &self.entity_buffer,
                     outline_base,
+                    self.own_timing.as_mut(),
                 );
             } else {
                 skinner.dispatch(
@@ -8941,6 +8947,7 @@ impl Renderer {
                     &self.entity_buffer,
                     0,
                     outline_base,
+                    self.own_timing.as_mut(),
                 );
             }
         }
@@ -9271,9 +9278,6 @@ impl Renderer {
             format: Some(self.output.frame.format),
             ..Default::default()
         });
-        if let Some(timer) = &mut self.gpu_timer {
-            timer.begin(&mut encoder);
-        }
         // The frame's statistics (`show_stats`): a CPU frame's at once; a GPU frame's when the
         // pass's counts come back, with the CPU's part of it: the sections the walk listed but
         // those whose solid quads the pass drew (it counts them), its draws and every call.
