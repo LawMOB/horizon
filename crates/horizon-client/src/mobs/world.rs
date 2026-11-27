@@ -34,10 +34,16 @@ thread_local! {
     static NEAR_BUF_POOL: std::cell::RefCell<Vec<Vec<u32>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// What `push_entities` pushes: who, where, whether it rides a vehicle (`Entity.isPassenger`),
-/// whether it shares the pusher's root vehicle (`isPassengerOfSameVehicle`), and whether it is
-/// itself a vehicle.
-pub(super) type PushTarget = (Who, Vec3, bool, bool, bool);
+/// One candidate for `push_entities`, retaining the tick snapshot's mob sleeping flag.
+pub(super) struct PushTarget {
+    pub who: Who,
+    pub position: Vec3,
+    pub passenger: bool,
+    pub same_vehicle: bool,
+    pub vehicle: bool,
+    /// Only mob targets use this: the selected player is resolved again after the hooks.
+    pub sleeping: bool,
+}
 thread_local! {
     static PUSH_TARGETS: std::cell::RefCell<Vec<PushTarget>> = const { std::cell::RefCell::new(Vec::new()) };
 }
