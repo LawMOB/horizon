@@ -1427,7 +1427,7 @@ impl Game<'_> {
         pending.retained_passes += 1;
         if dispatch_panic.is_none() {
             // The successful final sweep consumed all pushes for surviving mobs.
-            pending.pushes = Default::default();
+            pending.pushes.clear();
         }
         self.creatures.pending.insert(level_id, pending);
         self.creatures.event_buf = events;
@@ -1497,7 +1497,7 @@ impl Game<'_> {
                 }
                 // As in the producer's successful final sweep, removed targets
                 // have no remaining owner to receive a push.
-                pending.pushes = Default::default();
+                pending.pushes.clear();
             }
             Ok(())
         }));
