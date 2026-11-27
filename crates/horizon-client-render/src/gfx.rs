@@ -7342,8 +7342,8 @@ impl Renderer {
         let mobile = false;
         let section_moving = mobile && self.arena.closing().is_some();
         let shrinking = mobile
-            && (section_moving
-                || self.sorted_indices.closing().is_some()
+            && !section_moving
+            && (self.sorted_indices.closing().is_some()
                 || self.translucent_arena.as_ref().is_some_and(|a| a.closing().is_some()));
         let left = if shrinking {
             budget
@@ -7355,10 +7355,10 @@ impl Renderer {
         }
         self.graveyard.add(self.sorted_indices.trim());
         arena::free_later(self.graveyard.advance());
-        if !mobile || !section_moving {
-            if left > 0 || !mobile {
-                self.shrink_translucent(left, budget, may_start);
-            }
+        // Compaction can close a page above: inspect its current state so a new
+        // translucent shrink never competes with an unfinished section move.
+        if (!mobile || self.arena.closing().is_none()) && (left > 0 || !mobile) {
+            self.shrink_translucent(left, budget, may_start);
         }
         if let Some(flat) = &mut self.flat {
             let translucent = self.translucent_arena.as_ref();
@@ -7516,7 +7516,7 @@ impl Renderer {
         // Include animation, uploads and GPU entity posing before the render passes.
         // Section copies already staged in this reused encoder remain outside the interval.
         if let Some(timer) = &mut self.gpu_timer {
-            timer.begin(&mut encoder);
+            timer.begin_sampled(&mut encoder, self.pass_timing || self.keep_timed_frames);
         }
         // Horizon's own passes are timed like a shader pack's, from the frame's first pass.
         if self.own_timing.is_some() != self.pass_timing {
