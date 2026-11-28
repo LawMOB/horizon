@@ -1514,6 +1514,7 @@ pub struct Renderer {
     world_views: world_views::Kept,
     world_view_side: u32,
     entity_pipeline: wgpu::RenderPipeline,
+    model_entity_pipeline: wgpu::RenderPipeline,
     static_entity_pipeline: wgpu::RenderPipeline,
     static_entity_group: wgpu::BindGroup,
     static_entity_transform: wgpu::Buffer,
@@ -3680,6 +3681,20 @@ impl Renderer {
             slope_scale: 0.0,
             clamp: 0.0,
         };
+        // Plain mob/player materials need fewer interpolated values than portals, glints and
+        // other special entity overlays. Keep the existing blend and depth behavior.
+        let model_entity_pipeline = entity_pipeline_with(EntityPipelineOptions {
+            label: "Entity models",
+            cull_mode: None,
+            depth_write: true,
+            compare: wgpu::CompareFunction::GreaterEqual,
+            bias: entity_bias,
+            blend: alpha_blend,
+            clouds: false,
+            vertex: "vs_entity_model",
+            fragment: "fs_entity_model",
+            write_mask: wgpu::ColorWrites::ALL,
+        });
         let entity_pipeline = entity_pipeline(
             "Entities",
             None,
@@ -4455,6 +4470,7 @@ impl Renderer {
             world_views: views,
             world_view_side: max_side,
             entity_pipeline,
+            model_entity_pipeline,
             static_entity_pipeline,
             weather,
             crumbling_pipeline,
@@ -10248,12 +10264,26 @@ impl Renderer {
                 pass.set_bind_group(0, &self.group, &[]);
             }
             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            let model_pipeline = if entity_stage.is_none()
+                && !pack_entities
+                && self.prepared_draws.is_empty()
+                && self.entity_batch.model_only
+                && (posed == 0
+                    || self
+                        .entity_skin
+                        .as_ref()
+                        .is_some_and(|skin| skin.model_only))
+            {
+                &self.model_entity_pipeline
+            } else {
+                &self.entity_pipeline
+            };
             if entity_quads > 0 || !self.prepared_draws.is_empty() {
                 pass.stage(self.own_timing.as_mut(), "entities");
                 external::set_entity_pipeline(
                     &mut pass,
                     entity_stage,
-                    &self.entity_pipeline,
+                    model_pipeline,
                     false,
                 );
                 pass.set_bind_group(0, &self.entity_group, &[]);
@@ -10264,7 +10294,7 @@ impl Renderer {
                     prepared_model::draw_ordered(
                         &mut pass,
                         &prepared_model::EntityRangePass {
-                            pipeline: &self.entity_pipeline,
+                            pipeline: model_pipeline,
                             vertices: &self.entity_buffer,
                             indices: &self.indices,
                         },
