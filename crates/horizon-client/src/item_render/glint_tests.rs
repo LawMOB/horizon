@@ -16,7 +16,7 @@ pub(super) fn png(path: &Path, w: u32, h: u32, color: [u8; 4]) {
     writer.finish().unwrap();
 }
 
-fn fixture(name: &str) -> PathBuf {
+pub(super) fn fixture(name: &str) -> PathBuf {
     let root =
         std::env::temp_dir().join(format!("horizon-glint-5851-{name}-{}", std::process::id()));
     let write = |name: &str, data: &[u8]| {
@@ -56,7 +56,7 @@ fn fixture(name: &str) -> PathBuf {
     root
 }
 
-fn state(sprite: &str, foil: FoilType, display: DisplayContext) -> ItemRenderState {
+pub(super) fn state(sprite: &str, foil: FoilType, display: DisplayContext) -> ItemRenderState {
     let material = horizon_assets::model::Material {
         sprite: sprite.into(),
         force_translucent: false,
@@ -99,6 +99,7 @@ fn state(sprite: &str, foil: FoilType, display: DisplayContext) -> ItemRenderSta
         }],
         oversized_in_gui: false,
         animated: false,
+        volatile_geometry: false,
         cit_glint: None,
         hdr_tier: 0,
         hdr_light: 0,
