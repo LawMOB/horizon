@@ -19,8 +19,11 @@ impl Sorter {
             let [x, y, z] = std::array::from_fn(|j| camera[j] - c[j]);
             (i as u32, x * x + y * y + z * z)
         }));
-        // VertexSorting uses a stable merge sort, preserving mesh order for ties.
-        self.order.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // The list starts in mesh order. An explicit original-index tie break
+        // keeps VertexSorting's stable ordering while the in-place sort avoids
+        // allocating merge storage for every section that needs a resort.
+        self.order
+            .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         self.indices.clear();
         for &(quad, _) in &self.order {
             let v = quad * 4;
@@ -106,6 +109,47 @@ mod tests {
             &[8, 9, 10, 10, 11, 8, 0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4]
         );
         assert!(sorter.sort(&[], [0.0; 3]).is_empty());
+    }
+
+    #[test]
+    fn reused_sorter_matches_stable_mesh_order_for_large_tied_sections() {
+        let mut sorter = Sorter::default();
+        for (count, camera) in [
+            (1025, [0.0; 3]),
+            (3, [2.0, -1.0, 0.5]),
+            (2049, [3.0, 2.0, -0.5]),
+            (0, [0.0; 3]),
+            (513, [f32::INFINITY, 0.0, 0.0]),
+            (37, [-2.0, 1.0, 0.5]),
+        ] {
+            // Repeated and mirrored positions produce many distance ties,
+            // across both large resorts and changes to the reused buffers' size.
+            let centers: Vec<[f32; 3]> = (0..count)
+                .map(|i| {
+                    [
+                        (i % 17) as f32 - 8.0,
+                        (i % 7) as f32 - 3.0,
+                        if i % 11 < 5 { 2.0 } else { -2.0 },
+                    ]
+                })
+                .collect();
+            let mut reference: Vec<usize> = (0..count).collect();
+            let distance = |i: usize| {
+                let delta: [f32; 3] = std::array::from_fn(|axis| camera[axis] - centers[i][axis]);
+                delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]
+            };
+            // Independent stable ordering by distance alone: equal keys retain
+            // the reference list's original quad order, as vanilla requires.
+            reference.sort_by(|&a, &b| distance(b).total_cmp(&distance(a)));
+            let expected: Vec<u32> = reference
+                .into_iter()
+                .flat_map(|quad| {
+                    let v = quad as u32 * 4;
+                    [v, v + 1, v + 2, v + 2, v + 3, v]
+                })
+                .collect();
+            assert_eq!(sorter.sort(&centers, camera), expected.as_slice());
+        }
     }
 
     #[test]
