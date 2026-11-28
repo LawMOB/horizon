@@ -82,6 +82,12 @@ pub const WORLD_TEXT_OVERLAY: u32 = 39;
 /// The front of its eight-offset outlined text, using POLYGON_OFFSET.
 pub const WORLD_TEXT_POLYGON_OFFSET_OVERLAY: u32 = 40;
 
+/// Overlays handled by the ordinary model shader. HDR tiers and native entity
+/// tags live above the overlay word and do not change its fragment behaviour.
+pub(super) fn model_overlay(layer: u32) -> bool {
+    matches!(layer & 0xffff, 0 | 1 | 5 | 16..=31)
+}
+
 /// Ordinary vertices before every prepared cut, in one walk of the pre-batch stream.
 ///
 /// `EntityBatch::update` packs ordinary material first and draws the rest in later
@@ -155,6 +161,9 @@ pub(super) struct EntityBatch {
     // frame, keeping their storage.
     runs: [Vec<(usize, usize)>; MATERIALS],
     pub(super) combined: Vec<Vertex>,
+    /// True if every ordinary material vertex uses a model-shader overlay.
+    /// Other materials and separately drawn frame tails do not affect it.
+    pub(super) model_only: bool,
     /// Additive quads tagged `OIT_ENTITY` that the last `update` moved into the
     /// last material (improved transparency on): the dragon's eyes, which share
     /// the additive buffer with its rays.
@@ -217,6 +226,7 @@ impl EntityBatch {
             runs.clear();
         }
         let mut counts = [0usize; MATERIALS];
+        self.model_only = true;
         let mut start = 0;
         while start < quads.len() {
             let kind = material(quads[start][0].layer, oit);
@@ -224,6 +234,11 @@ impl EntityBatch {
                 .iter()
                 .position(|quad| material(quad[0].layer, oit) != kind)
                 .map_or(quads.len(), |n| start + 1 + n);
+            if kind == 0 && self.model_only {
+                self.model_only = entities[start * 4..end * 4]
+                    .iter()
+                    .all(|vertex| model_overlay(vertex.layer));
+            }
             self.runs[kind].push((start, end - start));
             counts[kind] += end - start;
             start = end;
@@ -348,6 +363,35 @@ fn ordinary_vertices_before(vertices: &[Vertex], cut: u32, oit: bool) -> u32 {
 mod tests {
     use super::*;
     use std::{hint::black_box, time::Instant};
+
+    #[test]
+    fn ordinary_model_selection_checks_every_vertex_and_ignores_other_draws() {
+        let quad = |layer| [Vertex { layer, ..geometry(1, false)[0] }; 4];
+        let mut batch = EntityBatch::default();
+        let entities: Vec<_> = [0, 1, 5, 16, 23, 31]
+            .into_iter()
+            .flat_map(|layer| quad(layer | 0x00ab_0000))
+            .chain(quad(SHADOW_OVERLAY))
+            .chain(quad(TEXT_POLYGON_OFFSET_OVERLAY))
+            .chain(quad(OIT_ENTITY | 7))
+            .chain(quad(TERRAIN_MODEL_CUTOUT_OVERLAY))
+            .collect();
+        batch.update(&entities, &quad(2), &quad(36), &quad(38), true);
+        assert!(batch.model_only);
+
+        batch.update(&entities, &[], &[], &[], false);
+        assert!(!batch.model_only);
+
+        let mut mixed = quad(0);
+        mixed[3].layer = 36;
+        batch.update(&mixed, &[], &[], &[], false);
+        assert!(!batch.model_only, "all four overlays must be safe");
+
+        batch.update(&quad(65_535), &[], &[], &[], false);
+        assert!(!batch.model_only, "unknown overlays use the general shader");
+        batch.update(&[], &quad(2), &[], &[], false);
+        assert!(batch.model_only, "empty ordinary draw resets the selection");
+    }
 
     #[test]
     fn ordinary_cuts_skip_shadows_and_text() {
