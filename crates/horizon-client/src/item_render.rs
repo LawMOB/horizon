@@ -210,6 +210,8 @@ pub struct ItemRenderState {
     pub layers: Vec<LayerRender>,
     pub oversized_in_gui: bool,
     pub animated: bool,
+    /// A native special renderer supplied these layers for this draw only.
+    pub(crate) volatile_geometry: bool,
     /// The OptiFine CIT glint layers the stack draws in the GUI (`cit_glint`).
     pub cit_glint: Option<Arc<crate::cit_glint::StackGlint>>,
     /// HDR output's tier of an item that glows (`dynamic_light::Luminance::hdr_tier`).
@@ -672,6 +674,8 @@ pub struct ItemRenderer {
     /// GUI items already drawn: the HUD vertices of a static item at a GUI position
     /// (`gui::draw`), which are the same every frame it stays there.
     pub(crate) gui_drawn: Mutex<HashMap<gui::DrawnKey, Arc<[crate::hud::HudVertex]>>>,
+    /// Clipped enchanted-item geometry; glint animation is applied when it draws.
+    pub(crate) gui_prepared: Mutex<gui::PreparedCache>,
     /// Entity model layers of the special renderers, with the head of each skull type a native
     /// mod registered, under its kind.
     parts: HashMap<String, ModelPart>,
@@ -733,6 +737,10 @@ impl ItemRenderer {
             .glint_atlas
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = sprites;
+        self.gui_prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         Ok(())
     }
 
@@ -857,6 +865,7 @@ impl ItemRenderer {
             baked: Mutex::default(),
             extents: Mutex::default(),
             gui_drawn: Mutex::default(),
+            gui_prepared: Mutex::default(),
             parts,
             skull_textures,
             grass,
@@ -1026,6 +1035,7 @@ impl ItemRenderer {
         };
         let resolved = self.models.resolve(stack, &ctx, env);
         let mut animated = false;
+        let mut volatile_geometry = false;
         let mut layers = Vec::with_capacity(resolved.layers.len());
         for layer in resolved.layers {
             let (geometry, baked, extents) = match layer.content {
@@ -1064,6 +1074,7 @@ impl ItemRenderer {
                 LayerContent::Parts(prepared) => {
                     // What a mod drew may change with every draw, so no GUI item is kept.
                     animated = true;
+                    volatile_geometry = true;
                     self.push_parts(
                         &mut layers,
                         display,
@@ -1091,6 +1102,7 @@ impl ItemRenderer {
             layers,
             oversized_in_gui: resolved.oversized_in_gui,
             animated,
+            volatile_geometry,
             cit_glint: None,
             hdr_tier: 0,
             hdr_light: 0,
@@ -1731,6 +1743,7 @@ mod tests {
             }],
             oversized_in_gui: false,
             animated: false,
+            volatile_geometry: false,
             cit_glint: None,
             hdr_tier: 0,
             hdr_light: 0,
