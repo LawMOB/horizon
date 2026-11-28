@@ -337,11 +337,23 @@ impl Game<'_> {
             // The meshes, once copied, are freed by a worker (`Streaming::free`).
             if !budgeted && self.pending_uploads.is_empty() && uploads.len() <= AUTO_UPLOADS_AT_ONCE
             {
-                horizon_client::spans::time("upload", || {
-                    for (key, mesh) in &uploads {
-                        renderer.upload(*key, mesh);
-                    }
+                // Even a small completion batch can contain expensive foliage
+                // meshes. Keep the small-batch fast path, but honor the same
+                // automatic time allowance used by the upload queue below.
+                let budget = self.upload_pace.budget(uploads.len(), arriving);
+                let uploaded = horizon_client::spans::time("upload", || {
+                    let started = Instant::now();
+                    upload_pace::upload_prefix(
+                        &uploads,
+                        budget,
+                        || started.elapsed(),
+                        |(key, mesh)| {
+                            renderer.upload(*key, mesh);
+                        },
+                    )
                 });
+                let mut uploads = uploads;
+                self.pending_uploads.extend(uploads.drain(uploaded..));
                 self.streaming.free(uploads);
             } else {
                 // Horizon's chunk-update and upload budgets: the nearest
