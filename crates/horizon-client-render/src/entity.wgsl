@@ -171,6 +171,60 @@ fn entity_vertex(position: vec3<f32>, uv: vec2<f32>,
     out.tier = (overlay >> 16u) & 0xffu;
     return out;
 }
+// Ordinary model batches (overlays 0, 1, 5 and 16..31) carry only the data their pixels
+// read. In particular, a face crossing the camera's near plane need not interpolate the
+// portal projection, sprite wrapping or glint UV of the shared entity/particle shader.
+// The renderer selects this pair only when the entire draw has these overlays.
+struct ModelOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) fog_distance: vec2<f32>,
+    @location(3) overlay_color: vec4<f32>,
+    @location(4) back_color: vec4<f32>,
+    @location(5) light_color: vec4<f32>,
+    // Bit 0: cull back faces; bits 8..15: HDR tier. Neither is interpolated.
+    @location(6) @interpolate(flat) flags: u32,
+}
+@vertex fn vs_entity_model(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>,
+    @location(2) overlay: u32, @location(3) color: vec4<f32>, @location(4) light: vec4<u32>,
+    @location(5) normal: vec4<f32>, @location(6) glint_uv: vec2<f32>) -> ModelOut {
+    let entity = entity_vertex(position, uv, 0u, color, light, normal);
+    var out: ModelOut;
+    out.clip = entity.clip;
+    out.uv = entity.uv;
+    out.color = entity.color;
+    out.fog_distance = entity.fog_distance;
+    out.overlay_color = overlay_texel(overlay & 0xffffu);
+    out.back_color = entity.back_color;
+    out.light_color = entity.light_color;
+    out.flags = entity.cull | (((overlay >> 16u) & 0xffu) << 8u);
+    return out;
+}
+@fragment fn fs_entity_model(in: ModelOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if (in.flags & 1u) != 0u && !front { discard; }
+    let texel = textureSample(atlas, atlas_sampler, in.uv);
+    let tint = select(in.back_color, in.color, front);
+    var color = texel * tint;
+    if color.a < 0.1 { discard; }
+    color = vec4(mix(in.overlay_color.rgb, color.rgb, in.overlay_color.a), color.a);
+    color *= in.light_color;
+    let fog = max(linear_fog(in.fog_distance.x, globals.fog.x, globals.fog.y),
+                  linear_fog(in.fog_distance.y, globals.fog.z, globals.fog.w));
+    color = vec4(mix(color.rgb, globals.fog_color.rgb, fog * globals.fog_color.a), color.a);
+    if HDR_WRITE_LIGHT && globals.hdr_light.w != 0.0 {
+        let tier = (in.flags >> 8u) & 0xffu;
+        var mark = 1.0;
+        if texel.a >= 0.1 && tier != 0u {
+            let fogged = max(linear_fog(in.fog_distance.x, globals.fog.x, globals.fog.y),
+                linear_fog(in.fog_distance.y, globals.fog.z, globals.fog.w)) * globals.fog_color.a;
+            let y = brightness(texel.rgb * in.color.rgb) * in.color.a * (1.0 - fogged);
+            mark = hdr_mark(tier, y);
+        }
+        return vec4(hdr_written(color.rgb, mark, globals.hdr_settings), color.a);
+    }
+    return frame_stored(color);
+}
 // Retained bolt-local geometry, translated using the same f64 camera
 // subtraction as the former CPU path before adding each local f32 position.
 // The bolt offset is instance attribute 7: 6 is the entity vertex's glint UV.
