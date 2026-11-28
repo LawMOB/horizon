@@ -14,6 +14,8 @@ use glam::{EulerRot, Mat4, Vec2, Vec3};
 use std::{collections::HashMap, f32::consts::PI, sync::Arc};
 
 mod depth;
+#[cfg(test)]
+mod prepared_tests;
 
 /// `Lighting.DIFFUSE_LIGHT_0` and `DIFFUSE_LIGHT_1`.
 fn diffuse_lights() -> (Vec3, Vec3) {
@@ -142,7 +144,7 @@ struct CitDraw<'a> {
 /// The CIT glint layers over the item's clipped faces (`fans`, in draw order), bottom first:
 /// each layer is one run over all of them, blended as its rule says, at its intensity times
 /// the glint strength option (`HudBatch::glint_alpha`).
-fn emit_cit(batch: &mut HudBatch, fans: &[Vec<Point>], cit: CitDraw) {
+fn emit_cit(batch: &mut HudBatch, fans: &[PreparedFan], cit: CitDraw) {
     let seconds = f64::from(cit.millis) / 1000.0;
     for (i, layer) in cit.glint.layers.iter().enumerate() {
         let Some(slot) = cit.textures.slot_of.get(layer.rule).copied().flatten() else {
@@ -160,6 +162,7 @@ fn emit_cit(batch: &mut HudBatch, fans: &[Vec<Point>], cit: CitDraw) {
         let uv = |v: Point| layer_uv(v.cit_uv, cit.millis, glint.speed, glint.rotation, 8.0);
         let start = batch.vertices.len();
         for fan in fans {
+            let fan = &fan.points;
             for k in 1..fan.len().saturating_sub(1) {
                 let corners = [fan[0], fan[k], fan[k + 1], fan[k + 1]];
                 batch.quad_glint(
@@ -204,6 +207,36 @@ pub fn draw(
     {
         batch.vertices.extend_from_slice(&drawn);
         return;
+    }
+    if let Some(key) = PreparedKey::of(state, renderer, sprites, x, y) {
+        let lookup = renderer
+            .gui_prepared
+            .lock()
+            .map_or(PreparedLookup::Direct, |cache| cache.lookup(&key));
+        let prepared = match lookup {
+            PreparedLookup::Hit(prepared) => Some(prepared),
+            PreparedLookup::Prepare => {
+                let prepared = Arc::new(prepare_now(state, renderer, sprites, host, x, y, None));
+                if let Ok(mut cache) = renderer.gui_prepared.lock() {
+                    cache.insert(key, Arc::clone(&prepared));
+                }
+                Some(prepared)
+            }
+            PreparedLookup::Direct => None,
+        };
+        if let Some(prepared) = prepared {
+            draw_prepared_state(
+                &prepared,
+                state,
+                renderer,
+                sprites,
+                batch,
+                time,
+                glint_speed,
+                glint_alpha,
+            );
+            return;
+        }
     }
     let start = batch.vertices.len();
     draw_now(
@@ -285,21 +318,36 @@ impl DrawnKey {
         x: f32,
         y: f32,
     ) -> Option<Self> {
-        if state.animated || state.cit_glint.is_some() {
+        if state.animated
+            || state.volatile_geometry
+            || state.cit_glint.is_some()
+            || state
+                .layers
+                .iter()
+                .any(|layer| layer.foil != super::FoilType::None)
+        {
             return None;
         }
+        Self::geometry_of(state, renderer, sprites, x, y)
+    }
+
+    fn geometry_of(
+        state: &ItemRenderState,
+        renderer: &ItemRenderer,
+        sprites: &HashMap<String, Rect>,
+        x: f32,
+        y: f32,
+    ) -> Option<Self> {
         let layers = state
             .layers
             .iter()
             .map(|layer| match &layer.geometry {
-                super::LayerGeometry::Quads(baked) if layer.foil == super::FoilType::None => {
-                    Some((
-                        Arc::as_ptr(baked) as usize,
-                        layer.tints.clone(),
-                        layer.matrix.to_cols_array().map(f32::to_bits),
-                        layer.uses_block_light,
-                    ))
-                }
+                super::LayerGeometry::Quads(baked) => Some((
+                    Arc::as_ptr(baked) as usize,
+                    layer.tints.clone(),
+                    layer.matrix.to_cols_array().map(f32::to_bits),
+                    layer.uses_block_light,
+                )),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
@@ -313,7 +361,136 @@ impl DrawnKey {
     }
 }
 
-/// [`draw`] without the cache.
+/// Geometry with foil remains still while its glint moves. Resolution still runs
+/// for every stack and frame; only the resolved baked layers are used as keys.
+/// Volatile mod parts and host-driven special renderers always draw directly.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PreparedKey {
+    geometry: DrawnKey,
+    foil: Vec<u8>,
+}
+
+impl PreparedKey {
+    fn of(
+        state: &ItemRenderState,
+        renderer: &ItemRenderer,
+        sprites: &HashMap<String, Rect>,
+        x: f32,
+        y: f32,
+    ) -> Option<Self> {
+        if state.display != horizon_assets::item_model::DisplayContext::Gui
+            || state.volatile_geometry
+            || state.cit_glint.is_some()
+            || !state
+                .layers
+                .iter()
+                .any(|layer| layer.foil != super::FoilType::None)
+        {
+            return None;
+        }
+        Some(Self {
+            geometry: DrawnKey::geometry_of(state, renderer, sprites, x, y)?,
+            foil: state.layers.iter().map(|layer| layer.foil as u8).collect(),
+        })
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.geometry.layers.capacity()
+            * std::mem::size_of::<(usize, Vec<i32>, [u32; 16], bool)>()
+            + self
+                .geometry
+                .layers
+                .iter()
+                .map(|layer| layer.1.capacity() * std::mem::size_of::<i32>())
+                .sum::<usize>()
+            + self.foil.capacity()
+    }
+}
+
+struct PreparedFan {
+    points: Vec<Point>,
+    color: u32,
+    foil: bool,
+}
+
+struct PreparedItem {
+    fans: Vec<PreparedFan>,
+}
+
+impl PreparedItem {
+    fn heap_bytes(&self) -> usize {
+        self.fans.capacity() * std::mem::size_of::<PreparedFan>()
+            + self
+                .fans
+                .iter()
+                .map(|fan| fan.points.capacity() * std::mem::size_of::<Point>())
+                .sum::<usize>()
+    }
+}
+
+const PREPARED_MAX_BYTES: usize = 1024 * 1024;
+const PREPARED_MAX_ENTRIES: usize = 256;
+
+/// Renderer-owned so a pack reload drops both pointer keys and their geometry.
+/// Geometry and key allocations have a 1 MiB budget, plus the bounded map's
+/// own buckets. Oversized geometry leaves a bounded key-only entry so later
+/// draws stream directly. Once full, new keys also stream; hot entries stay.
+#[derive(Default)]
+pub(crate) struct PreparedCache {
+    entries: HashMap<PreparedKey, Option<Arc<PreparedItem>>>,
+    bytes: usize,
+}
+
+enum PreparedLookup {
+    Hit(Arc<PreparedItem>),
+    Prepare,
+    Direct,
+}
+
+impl PreparedCache {
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    fn key_bytes(key: &PreparedKey) -> usize {
+        std::mem::size_of::<PreparedKey>()
+            + std::mem::size_of::<Option<Arc<PreparedItem>>>()
+            + key.heap_bytes()
+    }
+
+    fn lookup(&self, key: &PreparedKey) -> PreparedLookup {
+        match self.entries.get(key) {
+            Some(Some(prepared)) => PreparedLookup::Hit(Arc::clone(prepared)),
+            Some(None) => PreparedLookup::Direct,
+            None if self.entries.len() >= PREPARED_MAX_ENTRIES
+                || Self::key_bytes(key) > PREPARED_MAX_BYTES.saturating_sub(self.bytes) => {
+                    PreparedLookup::Direct
+                }
+            None => PreparedLookup::Prepare,
+        }
+    }
+
+    fn insert(&mut self, key: PreparedKey, prepared: Arc<PreparedItem>) {
+        if !matches!(self.lookup(&key), PreparedLookup::Prepare) {
+            return;
+        }
+        let key_bytes = Self::key_bytes(&key);
+        let geometry_bytes = std::mem::size_of::<PreparedItem>()
+            + 2 * std::mem::size_of::<usize>()
+            + prepared.heap_bytes();
+        let prepared = if geometry_bytes <= PREPARED_MAX_BYTES - self.bytes - key_bytes {
+            self.bytes += geometry_bytes;
+            Some(prepared)
+        } else {
+            None
+        };
+        self.bytes += key_bytes;
+        self.entries.insert(key, prepared);
+    }
+}
+
+/// Draw without the cache.
 #[allow(clippy::too_many_arguments)]
 fn draw_now(
     state: &ItemRenderState,
@@ -328,6 +505,65 @@ fn draw_now(
     glint_alpha: f32,
     scissor: Option<[f32; 4]>,
 ) {
+    let submitted = submit_now(state, renderer, sprites, host, x, y, scissor);
+    let glint = sprites
+        .contains_key("misc/enchanted_glint_item")
+        .then_some(Glint {
+            speed: glint_speed,
+            alpha: glint_alpha,
+            millis: time * 1000.0,
+            scale: 8.0,
+        });
+    batch.glint_alpha = glint_alpha;
+    let cit = state.cit_glint.as_deref().zip(renderer.cit.as_ref());
+    let cit = cit.map(|(glint, models)| CitDraw {
+        glint,
+        textures: &models.glint_textures,
+        rules: &models.rules.rules,
+        millis: time * 1000.0,
+    });
+    draw_quads_with(
+        &submitted.quads,
+        submitted.lights,
+        batch,
+        submitted.rect,
+        glint.as_ref(),
+        cit,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_now(
+    state: &ItemRenderState,
+    renderer: &ItemRenderer,
+    sprites: &HashMap<String, Rect>,
+    host: &dyn SpecialHost,
+    x: f32,
+    y: f32,
+    scissor: Option<[f32; 4]>,
+) -> PreparedItem {
+    #[cfg(test)]
+    prepared_tests::record_prepare();
+    let submitted = submit_now(state, renderer, sprites, host, x, y, scissor);
+    prepare_quads(&submitted.quads, submitted.lights, submitted.rect)
+}
+
+struct SubmittedItem {
+    quads: Vec<ItemQuad>,
+    lights: (Vec3, Vec3),
+    rect: [f32; 4],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_now(
+    state: &ItemRenderState,
+    renderer: &ItemRenderer,
+    sprites: &HashMap<String, Rect>,
+    host: &dyn SpecialHost,
+    x: f32,
+    y: f32,
+    scissor: Option<[f32; 4]>,
+) -> SubmittedItem {
     let pose = Mat4::from_translation(Vec3::new(x + 8.0, y + 8.0, 0.0))
         * Mat4::from_scale(Vec3::new(16.0, -16.0, 16.0));
     let mut quads: Vec<ItemQuad> = Vec::new();
@@ -356,6 +592,24 @@ fn draw_now(
         ],
         None => rect,
     };
+    SubmittedItem {
+        quads,
+        lights,
+        rect,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_prepared_state(
+    prepared: &PreparedItem,
+    state: &ItemRenderState,
+    renderer: &ItemRenderer,
+    sprites: &HashMap<String, Rect>,
+    batch: &mut HudBatch,
+    time: f32,
+    glint_speed: f32,
+    glint_alpha: f32,
+) {
     let glint = sprites
         .contains_key("misc/enchanted_glint_item")
         .then_some(Glint {
@@ -372,7 +626,7 @@ fn draw_now(
         rules: &models.rules.rules,
         millis: time * 1000.0,
     });
-    draw_quads_with(&quads, lights, batch, rect, glint.as_ref(), cit);
+    draw_prepared(prepared, batch, glint.as_ref(), cit);
 }
 
 /// Lights, culls, sorts far to near and clips `quads` (GUI positions) to
@@ -396,8 +650,33 @@ fn draw_quads_with(
     glint: Option<&Glint>,
     cit: Option<CitDraw>,
 ) {
-    // The faces the CIT layers go over once the item is drawn.
     let mut fans = Vec::new();
+    visit_quads(quads, lights, rect, |fan| {
+        emit(batch, &fan.points, |_| fan.color, None);
+        if fan.foil {
+            emit(batch, &fan.points, |_| fan.color, glint);
+        }
+        if cit.is_some() {
+            fans.push(fan);
+        }
+    });
+    if let Some(cit) = cit {
+        emit_cit(batch, &fans, cit);
+    }
+}
+
+fn prepare_quads(quads: &[ItemQuad], lights: (Vec3, Vec3), rect: [f32; 4]) -> PreparedItem {
+    let mut fans = Vec::new();
+    visit_quads(quads, lights, rect, |fan| fans.push(fan));
+    PreparedItem { fans }
+}
+
+fn visit_quads(
+    quads: &[ItemQuad],
+    lights: (Vec3, Vec3),
+    rect: [f32; 4],
+    mut visit: impl FnMut(PreparedFan),
+) {
     for face in depth::sort(quads) {
         let q = &quads[face.quad];
         let points: Vec<_> = face
@@ -417,17 +696,29 @@ fn draw_quads_with(
             if fan.len() < 3 {
                 continue;
             }
-            emit(batch, &fan, |_| color, None);
-            if q.foil != Foil::None {
-                emit(batch, &fan, |_| color, glint);
-            }
-            if cit.is_some() {
-                fans.push(fan);
-            }
+            visit(PreparedFan {
+                points: fan,
+                color,
+                foil: q.foil != Foil::None,
+            });
+        }
+    }
+}
+
+fn draw_prepared(
+    prepared: &PreparedItem,
+    batch: &mut HudBatch,
+    glint: Option<&Glint>,
+    cit: Option<CitDraw>,
+) {
+    for fan in &prepared.fans {
+        emit(batch, &fan.points, |_| fan.color, None);
+        if fan.foil {
+            emit(batch, &fan.points, |_| fan.color, glint);
         }
     }
     if let Some(cit) = cit {
-        emit_cit(batch, &fans, cit);
+        emit_cit(batch, &prepared.fans, cit);
     }
 }
 
