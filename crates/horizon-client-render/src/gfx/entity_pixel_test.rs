@@ -224,6 +224,17 @@ pub fn render(
     view_proj: Mat4,
     hdr: bool,
 ) -> std::result::Result<Vec<u8>, String> {
+    render_entry(vertices, atlas_size, atlas, view_proj, hdr, false)
+}
+
+fn render_entry(
+    vertices: &[Vertex],
+    atlas_size: [u32; 2],
+    atlas: &[u8],
+    view_proj: Mat4,
+    hdr: bool,
+    model: bool,
+) -> std::result::Result<Vec<u8>, String> {
     // The HDR mark pass is gone (the entity shader has no `fs_hdr_mark`): `hdr` changes nothing.
     let _ = hdr;
     let _gpu = crate::gfx::test_gpu::lock();
@@ -265,13 +276,13 @@ pub fn render(
             bias,
             blend,
             clouds: false,
-            vertex: "vs_entity",
+            vertex: if model { "vs_entity_model" } else { "vs_entity" },
             fragment,
             write_mask,
         })
     };
     let pipeline = make(
-        "fs_entity",
+        if model { "fs_entity_model" } else { "fs_entity" },
         true,
         wgpu::DepthBiasState {
             constant: 128,
@@ -786,5 +797,69 @@ mod instance_run {
         let plain = render(false, false).expect("color-only software Vulkan draw");
         let alpha = |pixels: &[u8]| pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>();
         assert_eq!(alpha(&per_copy), alpha(&plain), "a bias-0 mark must not change alpha");
+    }
+}
+
+#[cfg(test)]
+mod entity_model_pixels {
+    use super::*;
+
+    fn cube(overlay: u32, texture_alpha: u8, vertex_alpha: u8, cull: bool) -> Vec<Vertex> {
+        let (a, b, z0, z1) = (-0.8, 0.8, -0.3, 0.7);
+        let faces = [
+            [[a, a, z1], [b, a, z1], [b, b, z1], [a, b, z1]],
+            [[b, a, z0], [a, a, z0], [a, b, z0], [b, b, z0]],
+            [[a, a, z0], [a, a, z1], [a, b, z1], [a, b, z0]],
+            [[b, a, z1], [b, a, z0], [b, b, z0], [b, b, z1]],
+            [[a, b, z1], [b, b, z1], [b, b, z0], [a, b, z0]],
+            [[a, a, z0], [b, a, z0], [b, a, z1], [a, a, z1]],
+        ];
+        let layer = overlay | (2 << 16);
+        let alpha = u32::from_le_bytes([255, 255, 255, vertex_alpha]);
+        let w = if cull { -126 } else { -127 };
+        faces.into_iter().flatten().map(|pos| Vertex {
+            pos, uv: [0.5; 2], layer, color: alpha, light: 0xf0f0,
+            normal: [0, 127, 0, w], glint_uv: [0.0; 2],
+        }).collect()
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn model_shader_matches_generic_for_camera_inside_and_clipped_cube_faces() {
+        let cases = [
+            (0, 255, 255, false), (1, 255, 255, true),
+            (5, 128, 255, false), (16, 255, 128, false),
+            (31, 255, 20, false), (1, 20, 255, false),
+        ];
+        for (overlay, texture_alpha, vertex_alpha, cull) in cases {
+            let vertices = cube(overlay, texture_alpha, vertex_alpha, cull);
+            let atlas = [255, 255, 255, texture_alpha].repeat(16);
+            let generic = render_entry(&vertices, [4, 4], &atlas, Mat4::IDENTITY, false, false)
+                .expect("generic entity pixels");
+            let model = render_entry(&vertices, [4, 4], &atlas, Mat4::IDENTITY, false, true)
+                .expect("model entity pixels");
+            assert_eq!(
+                model,
+                generic,
+                "overlay {overlay}, texture alpha {texture_alpha}, vertex alpha {vertex_alpha}, cull {cull}"
+            );
+            if texture_alpha < 26 || vertex_alpha < 26 {
+                assert!(
+                    model
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+                );
+            } else {
+                assert!(
+                    model
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+                );
+            }
+        }
     }
 }
