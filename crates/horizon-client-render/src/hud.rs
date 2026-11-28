@@ -1842,6 +1842,48 @@ pub struct EndPortalFill {
     pub sprites: [[f32; 4]; 2],
     pub game_time: f32,
 }
+/// CPU geometry storage for one view's next HUD. No pictures, font patches,
+/// profiles or frame uniforms survive recycling.
+#[derive(Default)]
+pub struct HudBuffers {
+    vertices: Vec<HudVertex>,
+    blends: Vec<(std::ops::Range<u32>, Blend)>,
+}
+
+impl HudBuffers {
+    /// Retained allocation capacity only: larger HUDs still draw in full.
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    pub fn take(&mut self, window: [u32; 2], inputs: GuiScale) -> HudBatch {
+        HudBatch {
+            vertices: std::mem::take(&mut self.vertices),
+            blends: std::mem::take(&mut self.blends),
+            ..HudBatch::new(window, inputs)
+        }
+    }
+
+    pub fn recycle(&mut self, mut batch: HudBatch) {
+        let bytes = batch
+            .vertices
+            .capacity()
+            .saturating_mul(std::mem::size_of::<HudVertex>())
+            .saturating_add(
+                batch.blends.capacity().saturating_mul(std::mem::size_of::<(
+                    std::ops::Range<u32>,
+                    Blend,
+                )>()),
+            );
+        if bytes <= Self::MAX_BYTES {
+            batch.vertices.clear();
+            batch.blends.clear();
+            self.vertices = batch.vertices;
+            self.blends = batch.blends;
+        }
+        // Everything else in the consumed batch is dropped here, including
+        // picture/profile Arcs and any uploaded font/map patch pixels.
+    }
+}
+
 pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
     (a as u32) << 24 | (b as u32) << 16 | (g as u32) << 8 | r as u32
 }
@@ -3229,6 +3271,67 @@ mod coverage_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recycled_geometry_draws_like_a_fresh_hud_after_scale_and_screen_changes() {
+        fn paint(batch: &mut HudBatch) {
+            let corners = [[4.0, 5.0], [20.0, 5.0], [20.0, 21.0], [4.0, 21.0]];
+            let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+            batch.quad(corners, uv, 0xff12_3456);
+            let glint = batch.vertices.len();
+            batch.quad_glint(corners, uv, uv, u32::MAX);
+            batch.blend_since(glint, Blend::Additive);
+        }
+        let mut buffers = HudBuffers::default();
+        let inputs = GuiScale {
+            requested: 1,
+            unicode: false,
+        };
+        let mut old = buffers.take([1280, 720], inputs);
+        paint(&mut old);
+        old.glint_alpha = 0.25;
+        old.glint_colour = 0xff12_3456;
+        old.game_time = 0.5;
+        old.blur_at = 6;
+        old.end_portal.game_time = 0.75;
+        let profile = Arc::new(serde_json::json!({"name": "test"}));
+        let weak = Arc::downgrade(&profile);
+        old.inline_profiles.push(profile);
+        let allocation = old.vertices.as_ptr();
+        buffers.recycle(old);
+        assert!(weak.upgrade().is_none(), "frame profiles must be released");
+
+        let inputs = GuiScale {
+            requested: 3,
+            unicode: true,
+        };
+        let mut reused = buffers.take([1920, 1080], inputs);
+        let mut fresh = HudBatch::new([1920, 1080], inputs);
+        assert_eq!(
+            reused.vertices.as_ptr(),
+            allocation,
+            "reuse the geometry allocation",
+        );
+        assert!(reused.vertices.is_empty() && reused.blends.is_empty());
+        assert!(reused.pictures.is_empty() && reused.patches.is_empty());
+        assert!(reused.inline_profiles.is_empty());
+        assert_eq!(
+            [reused.scale, reused.width, reused.height],
+            [fresh.scale, fresh.width, fresh.height],
+        );
+        assert_eq!(reused.glint_alpha, fresh.glint_alpha);
+        assert_eq!(reused.glint_colour, fresh.glint_colour);
+        assert_eq!(reused.game_time, fresh.game_time);
+        assert_eq!(reused.blur_at, fresh.blur_at);
+        assert_eq!(reused.end_portal, fresh.end_portal);
+        paint(&mut reused);
+        paint(&mut fresh);
+        assert_eq!(
+            bytemuck::cast_slice::<HudVertex, u8>(&reused.vertices),
+            bytemuck::cast_slice::<HudVertex, u8>(&fresh.vertices),
+        );
+        assert_eq!(reused.runs(), fresh.runs());
+    }
 
     #[test]
     fn scratch_batch_ignores_view_settings() {
