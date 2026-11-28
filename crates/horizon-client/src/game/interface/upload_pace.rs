@@ -56,6 +56,26 @@ impl UploadPace {
     }
 }
 
+/// Upload the ready prefix that fits the existing automatic time allowance.
+/// One ready mesh always goes, even when that single upload exceeds the budget.
+/// The caller keeps the suffix queued and frees only the uploaded prefix.
+pub(super) fn upload_prefix<T>(
+    ready: &[T],
+    budget: Duration,
+    mut elapsed: impl FnMut() -> Duration,
+    mut upload: impl FnMut(&T),
+) -> usize {
+    let mut count = 0;
+    for mesh in ready {
+        if count > 0 && elapsed() >= budget {
+            break;
+        }
+        upload(mesh);
+        count += 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +86,60 @@ mod tests {
             pace.frame(Duration::from_micros(frame_us));
         }
         pace
+    }
+
+    #[test]
+    fn small_batches_obey_time_and_keep_every_mesh_in_order() {
+        use std::cell::Cell;
+
+        for count in 2..=8 {
+            let original: Vec<usize> = (0..count).collect();
+            for cost in [Duration::from_millis(3), Duration::from_micros(50)] {
+                let mut ready = original.clone();
+                let (mut drawn, mut freed) = (Vec::new(), Vec::new());
+                let mut frames = 0;
+                while !ready.is_empty() {
+                    let elapsed = Cell::new(Duration::ZERO);
+                    let uploaded = upload_prefix(
+                        &ready,
+                        AUTO_UPLOAD_TIME,
+                        || elapsed.get(),
+                        |&mesh| {
+                            drawn.push(mesh);
+                            elapsed.set(elapsed.get() + cost);
+                        },
+                    );
+                    if frames == 0 {
+                        assert_eq!(
+                            uploaded,
+                            if cost > AUTO_UPLOAD_TIME { 1 } else { count },
+                            "expensive small batches must split; quick ones finish together",
+                        );
+                    }
+                    // Only uploaded meshes are freed; the exact suffix is retained
+                    // for subsequent frames, as in the world's small-batch path.
+                    let pending: Vec<_> = ready.drain(uploaded..).collect();
+                    freed.extend(ready);
+                    ready = pending;
+                    frames += 1;
+                }
+                assert_eq!(drawn, original);
+                assert_eq!(freed, original);
+                assert_eq!(frames, if cost > AUTO_UPLOAD_TIME { count } else { 1 });
+            }
+        }
+        let mut drawn = Vec::new();
+        let uploaded = upload_prefix(
+            &[42, 43],
+            Duration::ZERO,
+            || Duration::from_secs(1),
+            |&mesh| drawn.push(mesh),
+        );
+        assert_eq!(
+            uploaded, 1,
+            "a ready mesh must make progress even with no time left",
+        );
+        assert_eq!(drawn, vec![42]);
     }
 
     #[test]
