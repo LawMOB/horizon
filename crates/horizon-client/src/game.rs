@@ -1179,6 +1179,8 @@ struct Game<'a> {
     last_device_recovery: Option<Instant>,
     /// CPU geometry storage retained across frames, including empty/title frames.
     entity_vertices: Vec<Vertex>,
+    /// Reused CPU HUD geometry; every frame still rebuilds its current contents.
+    hud_buffers: horizon_client::hud::HudBuffers,
     /// Reused entity shadow caster list; grows to the busiest observed frame.
     shadow_casters_scratch: Vec<(glam::DVec3, f32, f32)>,
     /// Horizon Extras' dynamic lights this frame (`dynamic_lights.rs`), and how brightly each
@@ -4667,7 +4669,7 @@ impl Game<'_> {
             || self.dialog_open())
             && self.player.is_none()
         {
-            HudBatch::new(size, self.settings.gui_scale_inputs())
+            self.hud_buffers.take(size, self.settings.gui_scale_inputs())
         } else {
             self.hud_layers(size)
         };
@@ -4694,7 +4696,7 @@ impl Game<'_> {
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
         self.input_hud_begin();
-        let mut batch = HudBatch::new(size, self.settings.gui_scale_inputs());
+        let mut batch = self.hud_buffers.take(size, self.settings.gui_scale_inputs());
         batch.glint_colour = self.pvp_glint_texel();
         // GlobalSettingsUniform's GameTime, for a resource pack's text shader.
         batch.game_time = ((self.world.game_time.rem_euclid(24000)) as f32
@@ -5516,24 +5518,27 @@ impl Game<'_> {
                 .view_frustum
                 .as_ref()
                 .filter(|_| self.pack_ids.is_none() && self.native_shaders.picked.is_empty());
+            let mut shadows = horizon_client::shadows::ShadowBatch::new(
+                &self.world,
+                self.res.facts(),
+                |state| {
+                    self.res
+                        .collision()
+                        .cached_shapes()
+                        .cached_shape(state)
+                        .ok()
+                        .flatten()
+                        .and_then(|shape| shape.bounds())
+                },
+                casters.len() > 1,
+            );
             for &(pos, radius, strength) in &casters {
                 if let Some(view) = shadow_view
                     && !horizon_client::shadows::in_view(view, camera, pos, radius, strength)
                 {
                     continue;
                 }
-                horizon_client::shadows::shadow(
-                    &self.world,
-                    self.res.facts(),
-                    &|state| {
-                        self.res
-                            .collision()
-                            .cached_shapes()
-                            .cached_shape(state)
-                            .ok()
-                            .flatten()
-                            .and_then(|shape| shape.bounds())
-                    },
+                shadows.shadow(
                     sprite,
                     camera,
                     pos,
@@ -5544,6 +5549,7 @@ impl Game<'_> {
                     &mut out,
                 );
             }
+            drop(shadows);
             self.shadow_casters_scratch = casters;
         }
         laps.lap("eg_shadows");
@@ -8826,6 +8832,7 @@ impl Game<'_> {
         // A frame the surface refused (occluded, lost, timed out) is `Ok(false)`.
         self.frame_drawn = matches!(result, Ok(true));
         // Restore storage even when rendering fails (for example, a lost surface).
+        self.hud_buffers.recycle(hud);
         self.entity_vertices = entities;
         self.world_geometry = Some(world_geometry);
         *self.entity_spans.get_mut() = entity_spans;
@@ -10602,6 +10609,7 @@ impl<'a> Game<'a> {
             renderer: None,
             last_device_recovery: None,
             entity_vertices: Vec::new(),
+            hud_buffers: Default::default(),
             shadow_casters_scratch: Vec::new(),
             dynamic_lights: Vec::new(),
             luminance: Default::default(),
