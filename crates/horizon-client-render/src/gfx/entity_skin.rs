@@ -15,6 +15,7 @@
 
 use horizon_shader_api::stages::RAY_ENTITY_QUAD;
 
+use super::entity_batch::model_overlay;
 use super::native_entity::EntityRuns;
 use super::pack_timing::PassTiming;
 use super::upload::Uploads;
@@ -174,6 +175,12 @@ impl SkinFrame {
             || !self.jobs.is_empty()
             || !self.outline_jobs.is_empty()
     }
+
+    /// The ordinary posed draw after culling has trimmed this frame's jobs.
+    /// Outline copies have their own shader and do not affect this selection.
+    fn model_only(&self) -> bool {
+        self.jobs.iter().all(|job| job.count == 0 || model_overlay(job.overlay))
+    }
 }
 
 /// Jobs per row of workgroups (the dispatch limit is 65535 per dimension).
@@ -188,6 +195,9 @@ pub(super) struct EntitySkin {
     jobs: Grow,
     /// The jobs with `dst` moved to the frame's gap, as uploaded.
     staged: Vec<SkinJob>,
+    /// The last successfully registered frame's ordinary jobs use only overlays
+    /// handled by the model shader; silhouettes are drawn separately.
+    pub(super) model_only: bool,
     /// For a native pack's `[entity]` stage: the runs of the next frame's posed vertices that
     /// it lights (`Renderer::take_entity_runs`).
     pub(super) kinds: EntityRuns,
@@ -272,6 +282,7 @@ impl EntitySkin {
                 buffer: None,
             },
             staged: Vec::new(),
+            model_only: false,
             kinds: EntityRuns::default(),
             group: None,
         })
@@ -291,6 +302,7 @@ impl EntitySkin {
         encoder: &mut wgpu::CommandEncoder,
         frame: &SkinFrame,
     ) -> bool {
+        self.model_only = false;
         if frame.reset {
             self.model.clear();
             self.model_buffer = None;
@@ -300,7 +312,11 @@ impl EntitySkin {
             return false;
         }
         if frame.new_model.is_empty() {
-            return self.model_buffer.is_some() || frame.jobs.is_empty();
+            let registered = self.model_buffer.is_some() || frame.jobs.is_empty();
+            if registered {
+                self.model_only = frame.model_only();
+            }
+            return registered;
         }
         let old = self.model.len();
         self.model.extend_from_slice(&frame.new_model);
@@ -327,6 +343,7 @@ impl EntitySkin {
             uploads.buffer(encoder, &buffer, 0, bytemuck::cast_slice(&self.model));
             self.model_buffer = Some(buffer);
         }
+        self.model_only = frame.model_only();
         true
     }
 
@@ -567,6 +584,47 @@ pub(super) fn poses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posed_model_selection_follows_the_remaining_ordinary_jobs() {
+        let mut frame = SkinFrame::default();
+        for overlay in [0, 1, 5, 16, 23, 31] {
+            frame.jobs.push(SkinJob {
+                overlay: overlay | 0xabcd_0000,
+                count: 4,
+                color: 0x80ff_ffff,
+                ..Default::default()
+            });
+        }
+        frame.vertices = 24;
+        frame.outline_jobs.push(SkinJob {
+            overlay: 36,
+            count: 4,
+            ..Default::default()
+        });
+        assert!(frame.model_only());
+
+        let mark = frame.mark();
+        for overlay in [2, 7, 36, 38, 65_535] {
+            frame.jobs.push(SkinJob {
+                overlay: overlay | 3 << 16,
+                count: 4,
+                ..Default::default()
+            });
+            frame.vertices += 4;
+            assert!(!frame.model_only(), "overlay {overlay} needs the general shader");
+            frame.truncate(mark);
+            assert!(frame.model_only(), "a culled job no longer affects the draw");
+        }
+        frame.jobs.push(SkinJob {
+            overlay: 36,
+            count: 0,
+            ..Default::default()
+        });
+        assert!(frame.model_only(), "padding writes no fragments");
+        frame.clear_draws();
+        assert!(frame.model_only(), "an empty frame retains no previous overlays");
+    }
 
     #[test]
     fn a_native_pack_poses_unless_a_mod_reads_the_cpu_entities() {
