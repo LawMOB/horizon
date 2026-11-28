@@ -7,6 +7,155 @@ use crate::{
     world::World,
 };
 use glam::DVec3;
+use horizon_core::geometry::Aabb;
+
+/// Receiver lookups shared by the shadows in one immutable frame. The bound
+/// limits memory in unusually spread-out scenes; overflow uses direct lookups.
+const RECEIVER_LIMIT: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct Receiver {
+    bounds: Aabb,
+    top: f64,
+    packed: u8,
+}
+
+struct CachedReceiver {
+    bounds: Aabb,
+    light: Option<u8>,
+}
+
+impl CachedReceiver {
+    fn new(bounds: Aabb) -> Self {
+        Self {
+            bounds,
+            light: None,
+        }
+    }
+
+    fn lit(&mut self, y: i32, feet: f64, light: impl FnOnce() -> u8) -> Option<Receiver> {
+        let top = f64::from(y - 1) + self.bounds.max_position().y;
+        if top > feet + 1e-6 {
+            return None;
+        }
+        Some(Receiver {
+            bounds: self.bounds,
+            top,
+            packed: *self.light.get_or_insert_with(light),
+        })
+    }
+}
+
+struct ReceiverCache {
+    entries: crate::fast_hash::FxHashMap<[i32; 3], Option<CachedReceiver>>,
+    enabled: bool,
+}
+
+impl ReceiverCache {
+    fn new(enabled: bool) -> Self {
+        Self {
+            entries: Default::default(),
+            enabled,
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        key: [i32; 3],
+        feet: f64,
+        bounds: impl FnOnce() -> Option<Aabb>,
+        light: impl FnOnce() -> u8,
+    ) -> Option<Receiver> {
+        use std::collections::hash_map::Entry;
+        if !self.enabled {
+            return CachedReceiver::new(bounds()?).lit(key[1], feet, light);
+        }
+        let full = self.entries.len() >= RECEIVER_LIMIT;
+        let receiver = match self.entries.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) if !full => entry.insert(bounds().map(CachedReceiver::new)),
+            Entry::Vacant(_) => {
+                return CachedReceiver::new(bounds()?).lit(key[1], feet, light);
+            }
+        };
+        receiver.as_mut()?.lit(key[1], feet, light)
+    }
+}
+
+/// A batch's shadows share receiver blocks, collision bounds and light. Owns
+/// only this frame's cache and borrows its immutable inputs, so moving mobs,
+/// changed blocks or changed light cannot reuse a previous frame's receivers.
+pub struct ShadowBatch<'a, F> {
+    world: &'a World,
+    facts: &'a BlockFacts,
+    collision_bounds: F,
+    receivers: ReceiverCache,
+}
+
+impl<'a, F> ShadowBatch<'a, F>
+where
+    F: Fn(horizon_world::registry::BlockStateId) -> Option<Aabb>,
+{
+    pub fn new(world: &'a World, facts: &'a BlockFacts, collision_bounds: F, cache: bool) -> Self {
+        Self {
+            world,
+            facts,
+            collision_bounds,
+            receivers: ReceiverCache::new(cache),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn shadow(
+        &mut self,
+        sprite: Rect,
+        camera: DVec3,
+        pos: DVec3,
+        radius: f32,
+        strength: f32,
+        ambient_light: f32,
+        sky_darken: i32,
+        out: &mut Vec<Vertex>,
+    ) {
+        let (world, facts, collision_bounds) = (self.world, self.facts, &self.collision_bounds);
+        shadow_with(
+            |[x, y, z], feet| {
+                self.receivers.resolve(
+                    [x, y, z],
+                    feet,
+                    || receiver_bounds(world, facts, collision_bounds, x, y, z),
+                    || world.light(x, y, z),
+                )
+            },
+            sprite,
+            camera,
+            pos,
+            radius,
+            strength,
+            ambient_light,
+            sky_darken,
+            out,
+        );
+    }
+}
+
+fn receiver_bounds(
+    world: &World,
+    facts: &BlockFacts,
+    collision_bounds: &impl Fn(horizon_world::registry::BlockStateId) -> Option<Aabb>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<Aabb> {
+    let state = world.block(x, y - 1, z);
+    let below = facts.get(state);
+    // extractShadowPiece: only a block whose collision shape is a full
+    // block takes a shadow (hoppers, cauldrons, slabs, farmland... take none).
+    if below.render_shape == crate::blocks::RenderShape::Invisible || !below.full_collision {
+        return None;
+    }
+    collision_bounds(state)
+}
 
 /// Resolve renderer metadata once while loading a registered content mob type.
 pub(crate) fn content_shadow(row: &serde_json::Value) -> Option<(f32, f32)> {
@@ -201,6 +350,34 @@ pub fn shadow(
     sky_darken: i32,
     out: &mut Vec<Vertex>,
 ) {
+    shadow_with(
+        |[x, y, z], feet| {
+            CachedReceiver::new(receiver_bounds(world, facts, collision_bounds, x, y, z)?)
+                .lit(y, feet, || world.light(x, y, z))
+        },
+        sprite,
+        camera,
+        pos,
+        radius,
+        strength,
+        ambient_light,
+        sky_darken,
+        out,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shadow_with(
+    mut receiver: impl FnMut([i32; 3], f64) -> Option<Receiver>,
+    sprite: Rect,
+    camera: DVec3,
+    pos: DVec3,
+    radius: f32,
+    strength: f32,
+    ambient_light: f32,
+    sky_darken: i32,
+    out: &mut Vec<Vertex>,
+) {
     let Some((radius, pow)) = shadow_gates(radius, strength, pos.distance_squared(camera)) else {
         return;
     };
@@ -215,24 +392,9 @@ pub fn shadow(
     for z in z0..=z1 {
         for x in x0..=x1 {
             for y in y0..=y1.saturating_add(1) {
-                let state = world.block(x, y - 1, z);
-                let below = facts.get(state);
-                if below.render_shape == crate::blocks::RenderShape::Invisible {
-                    continue;
-                }
-                // extractShadowPiece: only a block whose collision shape is a full
-                // block takes a shadow (hoppers, cauldrons, slabs, farmland... take none).
-                if !below.full_collision {
-                    continue;
-                }
-                let Some(bounds) = collision_bounds(state) else {
+                let Some(Receiver { bounds, top, packed }) = receiver([x, y, z], pos.y) else {
                     continue;
                 };
-                let top = f64::from(y - 1) + bounds.max_position().y;
-                if top > pos.y + 1e-6 {
-                    continue;
-                }
-                let packed = world.light(x, y, z);
                 let raw = (i32::from(packed >> 4) - sky_darken).max(i32::from(packed & 15));
                 if raw <= 3 {
                     continue;
@@ -285,6 +447,142 @@ pub fn shadow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_receivers_preserve_overlapping_shadows_and_bound_lookup_storage() {
+        use horizon_core::geometry::Vec3;
+        use std::cell::Cell;
+
+        let sprite = Rect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            w: 16,
+            h: 16,
+        };
+        let bounds = Aabb::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0));
+        let mut previous = Vec::new();
+        for frame in 0..2 {
+            // Each new immutable frame has new receivers, just like ShadowBatch.
+            let mut cache = ReceiverCache::new(true);
+            let mut direct = ReceiverCache::new(false);
+            let (cached_bounds, cached_light) = (Cell::new(0), Cell::new(0));
+            let (direct_bounds, direct_light) = (Cell::new(0), Cell::new(0));
+            let (mut cached_vertices, mut direct_vertices) = (Vec::new(), Vec::new());
+            for caster in 0..12 {
+                let camera = DVec3::new(8.0 + f64::from(frame), 66.0, 4.0);
+                let pos = DVec3::new(
+                    8.0 + f64::from(caster % 3) * 0.2 + f64::from(frame) * 0.1,
+                    64.0 + f64::from(caster % 4) * 0.5,
+                    8.0 + f64::from(caster % 2) * 0.25,
+                );
+                for (receivers, vertices, bounds_calls, light_calls) in [
+                    (&mut cache, &mut cached_vertices, &cached_bounds, &cached_light),
+                    (&mut direct, &mut direct_vertices, &direct_bounds, &direct_light),
+                ] {
+                    shadow_with(
+                        |key, feet| {
+                            receivers.resolve(
+                                key,
+                                feet,
+                                || {
+                                    bounds_calls.set(bounds_calls.get() + 1);
+                                    // A step initially lies above some casters' feet; a later
+                                    // caster still needs its cached shape and light. The next
+                                    // frame changes the receiver surface as well as the view.
+                                    let y = if key[0] % 3 == 0 { 65 } else { 64 - frame };
+                                    (key[1] == y && key[2] % 4 != 0).then_some(bounds)
+                                },
+                                || {
+                                    light_calls.set(light_calls.get() + 1);
+                                    if frame == 0 { 0xf0 } else { 0xc8 }
+                                },
+                            )
+                        },
+                        sprite,
+                        camera,
+                        pos,
+                        0.7,
+                        1.0,
+                        if frame == 0 { 0.0 } else { 0.2 },
+                        frame * 4,
+                        vertices,
+                    );
+                }
+            }
+            assert!(!cached_vertices.is_empty(), "exercise actual shadow quads");
+            assert_eq!(
+                bytemuck::cast_slice::<Vertex, u8>(&cached_vertices),
+                bytemuck::cast_slice::<Vertex, u8>(&direct_vertices),
+                "cached receiver lookup must preserve every vertex and its order",
+            );
+            assert!(cached_bounds.get() * 2 < direct_bounds.get());
+            assert!(cached_light.get() > 0 && cached_light.get() * 2 < direct_light.get());
+            assert!(
+                direct.entries.is_empty(),
+                "a single-caster batch allocates no map",
+            );
+            let bytes = bytemuck::cast_slice::<Vertex, u8>(&cached_vertices).to_vec();
+            if frame != 0 {
+                assert_ne!(bytes, previous, "the fresh frame must use changed inputs");
+            }
+            previous = bytes;
+        }
+
+        // A receiver above the first caster's feet must keep its shape,
+        // without reading light until a later, higher caster can use it.
+        let mut raised = ReceiverCache::new(true);
+        assert!(
+            raised
+                .resolve(
+                    [9, 65, 7],
+                    64.0,
+                    || Some(bounds),
+                    || panic!("receiver is above the caster"),
+                )
+                .is_none()
+        );
+        let receiver = raised
+            .resolve(
+                [9, 65, 7],
+                65.0,
+                || panic!("reuse the cached shape"),
+                || 0xf0,
+            )
+            .unwrap();
+        assert_eq!(receiver.top, 65.0);
+        assert_eq!(receiver.packed, 0xf0);
+
+        let mut cache = ReceiverCache::new(true);
+        for x in 0..RECEIVER_LIMIT as i32 {
+            assert!(
+                cache.resolve([x, 64, 0], 64.0, || Some(bounds), || 0xf0).is_some()
+            );
+        }
+        let overflow_calls = Cell::new(0);
+        for _ in 0..2 {
+            let receiver = cache.resolve(
+                [RECEIVER_LIMIT as i32, 64, 0],
+                64.0,
+                || {
+                    overflow_calls.set(overflow_calls.get() + 1);
+                    Some(bounds)
+                },
+                || 0xc8,
+            );
+            assert_eq!(receiver.unwrap().packed, 0xc8);
+        }
+        assert_eq!(cache.entries.len(), RECEIVER_LIMIT);
+        assert_eq!(overflow_calls.get(), 2, "overflow must use direct lookups");
+        assert_eq!(
+            cache.resolve([0, 64, 0], 64.0, || panic!("cached"), || panic!("cached"))
+                .unwrap()
+                .packed,
+            0xf0,
+            "overflow must retain previously cached receivers",
+        );
+    }
+
     #[test]
     fn culling_bounds_contain_the_generated_shadow_quads() {
         use crate::chunk::Chunk;
