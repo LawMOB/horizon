@@ -7419,6 +7419,7 @@ impl Renderer {
         }
         // Waits for the submit thread since the last frame's present (this frame's uploads).
         let queued = self.queue.take_waited();
+        laps.lap("r_acquire_setup");
         let acquire = Instant::now();
         let fg_frames = fg
             .then(|| {
@@ -7441,6 +7442,7 @@ impl Renderer {
             self.surface.as_ref().map(|s| s.get_current_texture())
         };
         let acquired_in = acquire.elapsed();
+        laps.lap("r_acquire");
         self.last_wait = landed + queued + acquired_in;
         // Inside the acquire's time already.
         self.queue.take_waited();
@@ -7551,7 +7553,7 @@ impl Renderer {
         let views = self.views(frame);
         let pose = frame.bob * frame.spin;
         let view_proj = views.primary().view_proj(pose);
-        laps.lap("r_acquire");
+        laps.lap("r_frame_setup");
         // TAA runs where the world post pass does, and where it resolves a native pack's world.
         let taa = taa_allowed(
             frame.title,
